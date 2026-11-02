@@ -113,8 +113,8 @@ void drawStats();
 void drawClock();
 void drawDate();
 void drawWeather();
-void drawHeadlines();
 void drawStatusLine();
+void drawLiveButton();
 void drawNewsPage();
 void drawSystemPage();
 void drawQr(const String& text, int x, int y);
@@ -233,7 +233,7 @@ void buildTicker() {
     if (i) tickerText += "     \xB7     ";
     tickerText += feed.headlines[i];
   }
-  tickerW = tft.textWidth(tickerText, 2);
+  tickerW = tft.textWidth(tickerText, 4);
   tickerX = 320;
 }
 
@@ -316,23 +316,6 @@ void drawWeather() {
   tft.drawString(fitText(city, 116, 2), 312, 32);
 }
 
-void drawHeadlines() {
-  tft.fillRect(0, 180, 320, 36, C_BG);
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextFont(2);
-  if (feed.count == 0) {
-    tft.setTextColor(C_DIM, C_BG);
-    tft.drawString("Waiting for news feed...", 8, 182);
-    return;
-  }
-  tft.setTextColor(C_TEXT, C_BG);
-  tft.drawString(fitText(feed.headlines[0], 304, 2), 8, 182);
-  if (feed.count > 1) {
-    tft.setTextColor(C_DIM, C_BG);
-    tft.drawString(fitText(feed.headlines[1], 304, 2), 8, 198);
-  }
-}
-
 void drawStatusLine() {
   tft.fillRect(0, 170, 320, 10, C_BG);
   tft.fillRect(140, 170, 180, 10, C_BG);
@@ -352,29 +335,29 @@ void drawStatusLine() {
 
 void drawTickerFrame() {
   if (!tickerReady) {
-    tft.fillRect(0, 216, 320, 24, C_BG);
+    tft.fillRect(0, 184, 320, 32, C_BG);
     if (tickerText.length()) {
       tft.setTextDatum(TL_DATUM);
-      tft.setTextFont(2);
+      tft.setTextFont(4);
       tft.setTextColor(C_TEXT, C_BG);
-      tft.drawString(tickerText, tickerX, 220);
+      tft.drawString(tickerText, tickerX, 187);
     }
-    tft.fillRoundRect(0, 216, 44, 24, 6, C_ACC);
-    tft.setTextDatum(TL_DATUM);
-    tft.setTextFont(2);
-    tft.setTextColor(TFT_BLACK, C_ACC);
-    tft.drawString("LIVE", 7, 220);
     return;
   }
   ticker.fillSprite(C_BG);
   ticker.setTextDatum(TL_DATUM);
-  ticker.setTextFont(2);
+  ticker.setTextFont(4);
   ticker.setTextColor(C_TEXT, C_BG);
-  if (tickerText.length()) ticker.drawString(tickerText, tickerX, 4);
-  ticker.fillRoundRect(0, 0, 44, 24, 6, C_ACC);
-  ticker.setTextColor(TFT_BLACK, C_ACC);
-  ticker.drawString("LIVE", 7, 4);
-  ticker.pushSprite(0, 216);
+  if (tickerText.length()) ticker.drawString(tickerText, tickerX, 3);
+  ticker.pushSprite(0, 184);
+}
+
+void drawLiveButton() {
+  tft.fillRoundRect(0, 216, 44, 24, 6, C_ACC);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_BLACK, C_ACC);
+  tft.drawString("LIVE", 7, 220);
 }
 
 void drawTickerStep() {
@@ -393,12 +376,12 @@ void drawDashboard() {
   drawWeather();
   drawStats();
   drawStatusLine();
-  drawHeadlines();
   if (tickerText.length()) {
-    tickerW = tft.textWidth(tickerText, 2);
+    tickerW = tft.textWidth(tickerText, 4);
     tickerX = 320;
   }
   drawTickerFrame();
+  drawLiveButton();
   lastMinute = -1;
   lastDay = -1;
   feedDirty = false;
@@ -806,7 +789,6 @@ void updateDisplay() {
     if (feedDirty) {
       feedDirty = false;
       drawWeather();
-      drawHeadlines();
     }
     drawTickerStep();
     if (now - lastPageChange > 30000) lastPageChange = now;
@@ -866,7 +848,7 @@ void setup() {
   digitalWrite(PIN_TOUCH_CS, HIGH);
 
   ticker.setColorDepth(16);
-  tickerReady = ticker.createSprite(320, 24) != nullptr;
+  tickerReady = ticker.createSprite(320, 32) != nullptr;
   Serial.printf("Ticker sprite: %s\n", tickerReady ? "ok" : "FAILED");
 
   page = 0;

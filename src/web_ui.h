@@ -62,7 +62,15 @@ input[type=range]{width:100%;accent-color:var(--acc)}
 
   <section class="card">
     <h2>Location &amp; time</h2>
-    <label>City label</label>
+    <label>Find weather location</label>
+    <div class="row">
+      <input type="text" id="locationSearch" placeholder="City, postcode or place">
+      <button class="ghost" id="locationBtn" style="flex:0 0 90px">Search</button>
+    </div>
+    <label id="locationResultsLabel" hidden>Matching locations</label>
+    <select id="locationResults" hidden></select>
+    <div class="msg" id="locationMsg">Search by city or postcode, then choose the correct match.</div>
+    <label>Display label</label>
     <input type="text" id="city" placeholder="London">
     <div class="row">
       <div><label>Latitude</label><input type="number" id="lat" step="0.0001" placeholder="51.5072"></div>
@@ -76,6 +84,7 @@ input[type=range]{width:100%;accent-color:var(--acc)}
     <input type="text" id="feed" placeholder="http://feeds.bbci.co.uk/news/rss.xml">
     <div class="actions"><button id="saveBtn">Save settings</button></div>
     <div class="msg" id="saveMsg"></div>
+    <div class="hint">Location search by Open-Meteo and GeoNames. Manual coordinates remain available for exact positioning.</div>
   </section>
 
   <section class="card">
@@ -86,7 +95,7 @@ input[type=range]{width:100%;accent-color:var(--acc)}
     <select id="invert"><option value="0">Off</option><option value="1">On</option></select>
     <label>Orientation</label>
     <select id="rotation"><option value="1">Landscape</option><option value="3">Landscape (flipped)</option></select>
-    <div class="hint">Tap the screen to cycle dashboard → news → system.</div>
+    <div class="hint">Tap the screen to cycle dashboard → news → forecast → system.</div>
   </section>
 
   <section class="card">
@@ -112,12 +121,14 @@ input[type=range]{width:100%;accent-color:var(--acc)}
 <script>
 const $=s=>document.querySelector(s);
 let cfg={};
+let locations=[];
 function toast(t){const e=$('#toast');e.textContent=t;e.classList.add('show');clearTimeout(e._t);e._t=setTimeout(()=>e.classList.remove('show'),2200);}
 function post(url,data){return fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data||{})}).then(r=>r.json());}
 function fmtUp(s){s=Math.floor(s);const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?`${d}d ${h}h`:(h?`${h}h ${m}m`:`${m}m`);}
 async function loadCfg(){
   cfg=await fetch('/api/config').then(r=>r.json());
   $('#city').value=cfg.city||'';$('#lat').value=cfg.lat;$('#lon').value=cfg.lon;
+  $('#locationSearch').value=cfg.city||'';
   $('#units').value=cfg.units||'metric';$('#tz').value=cfg.tz||'';$('#feed').value=cfg.feed||'';
   $('#brightness').value=cfg.brightness||255;$('#briVal').textContent=cfg.brightness||255;
   $('#invert').value=cfg.invert?'1':'0';$('#rotation').value=String(cfg.rotation||1);
@@ -140,6 +151,44 @@ async function loadStatus(){
       : `<span style="color:var(--bad)">● offline</span> — start agent\\agent.py on your PC`;
   }catch(e){$('#chips').innerHTML='<span class="chip">device unreachable</span>';}
 }
+function locationName(r){
+  return [r.name,r.admin1&&r.admin1!==r.name?r.admin1:'',r.country].filter(Boolean).join(', ');
+}
+function chooseLocation(index){
+  const r=locations[index];if(!r)return;
+  $('#city').value=r.name||'';
+  $('#lat').value=Number(r.latitude).toFixed(4);
+  $('#lon').value=Number(r.longitude).toFixed(4);
+  $('#locationMsg').className='msg ok';
+  $('#locationMsg').textContent=`Selected ${locationName(r)} — save settings to apply it.`;
+}
+async function searchLocations(){
+  const query=$('#locationSearch').value.trim();
+  if(query.length<2){$('#locationMsg').className='msg bad';$('#locationMsg').textContent='Enter at least two characters';return;}
+  const b=$('#locationBtn');b.disabled=true;b.textContent='…';
+  $('#locationMsg').className='msg';$('#locationMsg').textContent='Searching…';
+  try{
+    const url='https://geocoding-api.open-meteo.com/v1/search?name='+encodeURIComponent(query)+'&count=10&language=en&format=json';
+    const data=await fetch(url).then(r=>{if(!r.ok)throw new Error('search failed');return r.json();});
+    locations=data.results||[];
+    const sel=$('#locationResults');sel.innerHTML='';
+    if(!locations.length){
+      sel.hidden=true;$('#locationResultsLabel').hidden=true;
+      $('#locationMsg').className='msg bad';$('#locationMsg').textContent='No matching locations found';
+    }else{
+      locations.forEach((r,i)=>{const o=document.createElement('option');o.value=String(i);o.textContent=locationName(r);sel.appendChild(o);});
+      sel.hidden=false;$('#locationResultsLabel').hidden=false;
+      chooseLocation(0);
+    }
+  }catch(e){
+    $('#locationMsg').className='msg bad';
+    $('#locationMsg').textContent='Location search needs internet access. You can still enter coordinates manually.';
+  }
+  b.disabled=false;b.textContent='Search';
+}
+$('#locationBtn').onclick=searchLocations;
+$('#locationSearch').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();searchLocations();}};
+$('#locationResults').onchange=e=>chooseLocation(+e.target.value);
 $('#scanBtn').onclick=async()=>{
   const b=$('#scanBtn');b.disabled=true;b.textContent='…';
   try{

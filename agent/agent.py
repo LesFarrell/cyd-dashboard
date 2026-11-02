@@ -6,6 +6,7 @@ headlines, then pushes them to the ESP32 over your LAN.
 """
 
 import argparse
+import datetime
 import html
 import json
 import os
@@ -164,6 +165,8 @@ def fetch_weather(lat, lon, units):
         "latitude": lat,
         "longitude": lon,
         "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m",
+        "daily": "weather_code,temperature_2m_max,temperature_2m_min",
+        "forecast_days": 4,
         "timezone": "auto",
     }
     if units == "imperial":
@@ -171,13 +174,25 @@ def fetch_weather(lat, lon, units):
         params["wind_speed_unit"] = "mph"
     r = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=10)
     r.raise_for_status()
-    cur = r.json()["current"]
+    data = r.json()
+    cur = data["current"]
+    daily = data.get("daily", {})
+    forecast = []
+    for date_text, code, high, low in zip(
+        daily.get("time", []),
+        daily.get("weather_code", []),
+        daily.get("temperature_2m_max", []),
+        daily.get("temperature_2m_min", []),
+    ):
+        day = datetime.date.fromisoformat(date_text).strftime("%a")
+        forecast.append({"day": day, "code": code, "high": high, "low": low})
     return {
         "temp": cur["temperature_2m"],
         "feels": cur["apparent_temperature"],
         "humidity": cur["relative_humidity_2m"],
         "wind": cur["wind_speed_10m"],
         "code": cur["weather_code"],
+        "forecast": forecast,
     }
 
 

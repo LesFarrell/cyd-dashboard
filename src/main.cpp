@@ -27,6 +27,9 @@ static const uint16_t C_ACC = 0x05DF;
 static const uint16_t C_OK = 0x06EE;
 static const uint16_t C_WARN = 0xFD60;
 static const uint16_t C_BAD = 0xFACD;
+static const uint16_t C_SUN = 0xFEC0;
+static const uint16_t C_CLOUD = 0xBDF7;
+static const uint16_t C_RAIN = 0x4D7F;
 
 TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite ticker(&tft);
@@ -69,7 +72,13 @@ struct Stats {
 struct Feed {
   String city;
   String source;
+  String units;
   String headlines[8];
+  String forecastDay[4];
+  float forecastHigh[4];
+  float forecastLow[4];
+  int forecastCode[4];
+  int forecastCount = 0;
   int count = 0;
   float temp = 0;
   float feels = 0;
@@ -96,6 +105,7 @@ uint32_t lastClockMs = 0;
 uint32_t lastStatsMs = 0;
 uint32_t lastTickerMs = 0;
 uint32_t lastNewsMs = 0;
+uint32_t lastForecastMs = 0;
 uint32_t lastSysMs = 0;
 int lastMinute = -1;
 int lastDay = -1;
@@ -116,6 +126,7 @@ void drawWeather();
 void drawStatusLine();
 void drawLiveButton();
 void drawNewsPage();
+void drawForecastPage();
 void drawSystemPage();
 void drawQr(const String& text, int x, int y);
 
@@ -204,6 +215,11 @@ const char* weatherText(int code) {
 String fmtTemp(float v) {
   if (v < -100) return "--";
   return String((int)roundf(v)) + "C";
+}
+
+String fmtWeatherTemp(float v) {
+  if (v < -100) return "--";
+  return String((int)roundf(v)) + (feed.units == "imperial" ? "F" : "C");
 }
 
 String fmtUptime(uint32_t sec) {
@@ -309,7 +325,7 @@ void drawWeather() {
   tft.setTextDatum(TR_DATUM);
   tft.setTextFont(4);
   tft.setTextColor(feedFresh() ? C_TEXT : C_DIM, C_BG);
-  tft.drawString(feedFresh() ? fmtTemp(feed.temp) : "--", 312, 0);
+  tft.drawString(feedFresh() ? fmtWeatherTemp(feed.temp) : "--", 312, 0);
   tft.setTextFont(2);
   tft.setTextColor(C_DIM, C_BG);
   String city = feed.city.length() ? feed.city : cfg.city;
@@ -428,6 +444,135 @@ void drawNewsPage() {
   }
 }
 
+void drawSunIcon(int cx, int cy, int r) {
+  tft.fillCircle(cx, cy, r, C_SUN);
+  for (int i = 0; i < 8; i++) {
+    float a = i * PI / 4.0f;
+    int x1 = cx + (int)(cosf(a) * (r + 3));
+    int y1 = cy + (int)(sinf(a) * (r + 3));
+    int x2 = cx + (int)(cosf(a) * (r + 8));
+    int y2 = cy + (int)(sinf(a) * (r + 8));
+    tft.drawLine(x1, y1, x2, y2, C_SUN);
+  }
+}
+
+void drawCloudIcon(int cx, int cy, int scale) {
+  int r = 6 * scale;
+  tft.fillCircle(cx - 8 * scale, cy, r, C_CLOUD);
+  tft.fillCircle(cx, cy - 5 * scale, 8 * scale, C_CLOUD);
+  tft.fillCircle(cx + 9 * scale, cy, 7 * scale, C_CLOUD);
+  tft.fillRoundRect(cx - 15 * scale, cy, 30 * scale, 8 * scale, 3 * scale, C_CLOUD);
+}
+
+void drawWeatherIcon(int code, int cx, int cy, int scale) {
+  if (code == 0) {
+    drawSunIcon(cx, cy, 7 * scale);
+    return;
+  }
+  if (code == 1 || code == 2) {
+    drawSunIcon(cx - 8 * scale, cy - 7 * scale, 5 * scale);
+    drawCloudIcon(cx + 4 * scale, cy + 3 * scale, scale);
+    return;
+  }
+  if (code == 45 || code == 48) {
+    drawCloudIcon(cx, cy - 5 * scale, scale);
+    for (int i = 0; i < 3; i++) {
+      int y = cy + (7 + i * 5) * scale;
+      tft.drawFastHLine(cx - 14 * scale, y, 28 * scale, C_DIM);
+    }
+    return;
+  }
+
+  drawCloudIcon(cx, cy - 5 * scale, scale);
+  if ((code >= 51 && code <= 67) || (code >= 80 && code <= 82)) {
+    for (int i = -1; i <= 1; i++) {
+      int x = cx + i * 9 * scale;
+      int y = cy + 8 * scale + (i == 0 ? 3 * scale : 0);
+      tft.drawLine(x, y, x - 3 * scale, y + 7 * scale, C_RAIN);
+    }
+  } else if ((code >= 71 && code <= 77) || code == 85 || code == 86) {
+    for (int i = -1; i <= 1; i++) {
+      int x = cx + i * 9 * scale;
+      int y = cy + 13 * scale;
+      tft.drawLine(x - 3 * scale, y, x + 3 * scale, y, TFT_WHITE);
+      tft.drawLine(x, y - 3 * scale, x, y + 3 * scale, TFT_WHITE);
+      tft.drawLine(x - 2 * scale, y - 2 * scale, x + 2 * scale, y + 2 * scale, TFT_WHITE);
+    }
+  } else if (code >= 95) {
+    int x = cx - 2 * scale;
+    int y = cy + 5 * scale;
+    tft.fillTriangle(x, y, x + 7 * scale, y, x + 1 * scale, y + 9 * scale, C_WARN);
+    tft.fillTriangle(x + scale, y + 7 * scale, x + 5 * scale, y + 7 * scale,
+                     x - 3 * scale, y + 16 * scale, C_WARN);
+  }
+}
+
+void drawForecastPage() {
+  tft.fillScreen(C_BG);
+  tft.fillRect(0, 0, 320, 26, C_PANEL);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(2);
+  tft.setTextColor(C_ACC, C_PANEL);
+  tft.drawString("FORECAST", 8, 5);
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextColor(C_DIM, C_PANEL);
+  tft.drawString(fitText(feed.city.length() ? feed.city : cfg.city, 190, 2), 312, 5);
+
+  if (!feed.valid) {
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextFont(2);
+    tft.setTextColor(C_DIM, C_BG);
+    tft.drawString("Waiting for local weather...", 160, 120);
+    return;
+  }
+
+  drawWeatherIcon(feed.code, 42, 62, 2);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(4);
+  tft.setTextColor(C_TEXT, C_BG);
+  tft.drawString(fmtWeatherTemp(feed.temp), 88, 39);
+  tft.setTextFont(2);
+  tft.setTextColor(C_DIM, C_BG);
+  tft.drawString(weatherText(feed.code), 89, 69);
+
+  String windUnit = feed.units == "imperial" ? "mph" : "km/h";
+  String details = "Feels " + fmtWeatherTemp(feed.feels) + "   Hum " +
+                   String((int)roundf(feed.humidity)) + "%   Wind " +
+                   String((int)roundf(feed.wind)) + " " + windUnit;
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(C_DIM, C_BG);
+  tft.drawString(details, 160, 103);
+
+  for (int i = 0; i < 4; i++) {
+    int x = 5 + i * 79;
+    tft.fillRoundRect(x, 120, 73, 96, 7, C_PANEL);
+    if (i >= feed.forecastCount) continue;
+
+    tft.setTextDatum(TC_DATUM);
+    tft.setTextFont(2);
+    tft.setTextColor(i == 0 ? C_ACC : C_TEXT, C_PANEL);
+    tft.drawString(feed.forecastDay[i], x + 36, 126);
+    drawWeatherIcon(feed.forecastCode[i], x + 36, 161, 1);
+
+    tft.setTextDatum(TC_DATUM);
+    tft.setTextFont(2);
+    tft.setTextColor(C_TEXT, C_PANEL);
+    String temps = String((int)roundf(feed.forecastHigh[i])) + "/" +
+                   String((int)roundf(feed.forecastLow[i])) +
+                   (feed.units == "imperial" ? "F" : "C");
+    tft.drawString(temps, x + 36, 191);
+  }
+
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(1);
+  tft.setTextColor(C_DIM, C_BG);
+  tft.drawString("tap to cycle pages", 8, 226);
+  if (feed.valid) {
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString(String((millis() - feed.at) / 60000) + "m ago", 312, 226);
+  }
+}
+
 void drawQr(const String& text, int x, int y) {
   QRCode qr;
   uint8_t buf[512];
@@ -492,6 +637,7 @@ void drawSystemPage() {
 void drawPage(bool full) {
   if (page == 0) drawDashboard();
   else if (page == 1) drawNewsPage();
+  else if (page == 2) drawForecastPage();
   else drawSystemPage();
   lastStatsMs = millis();
 }
@@ -640,6 +786,7 @@ void handleFeed() {
   }
   feed.city = doc["city"] | "";
   feed.source = doc["source"] | "";
+  feed.units = doc["units"] | "metric";
   feed.temp = doc["temp"] | 0.0f;
   feed.feels = doc["feels"] | 0.0f;
   feed.humidity = doc["humidity"] | -1.0f;
@@ -652,6 +799,16 @@ void handleFeed() {
     String h = v.as<String>();
     h.trim();
     if (h.length()) feed.headlines[feed.count++] = h;
+  }
+  feed.forecastCount = 0;
+  JsonArray forecast = doc["forecast"].as<JsonArray>();
+  for (JsonObject day : forecast) {
+    if (feed.forecastCount >= 4) break;
+    int i = feed.forecastCount++;
+    feed.forecastDay[i] = day["day"] | "--";
+    feed.forecastHigh[i] = day["high"] | 0.0f;
+    feed.forecastLow[i] = day["low"] | 0.0f;
+    feed.forecastCode[i] = day["code"] | -1;
   }
   feed.valid = true;
   feed.at = millis();
@@ -763,7 +920,7 @@ void handleTouch() {
   if (!touchRead()) return;
   lastTouchMs = millis();
   lastPageChange = millis();
-  page = (page + 1) % 3;
+  page = (page + 1) % 4;
   drawPage(true);
 }
 
@@ -796,6 +953,16 @@ void updateDisplay() {
     if (now - lastNewsMs >= 5000) {
       lastNewsMs = now;
       drawNewsPage();
+    }
+    if (now - lastPageChange > 30000) {
+      page = 0;
+      lastPageChange = now;
+      drawPage(true);
+    }
+  } else if (page == 2) {
+    if (now - lastForecastMs >= 30000) {
+      lastForecastMs = now;
+      drawForecastPage();
     }
     if (now - lastPageChange > 30000) {
       page = 0;

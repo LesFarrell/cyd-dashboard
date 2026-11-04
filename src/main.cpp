@@ -7,6 +7,7 @@
 #include <ArduinoJson.h>
 #include <TFT_eSPI.h>
 #include <SPI.h>
+#include <SD.h>
 #include <qrcode.h>
 #include <time.h>
 #include "web_ui.h"
@@ -19,13 +20,11 @@ static constexpr int PIN_TOUCH_CS = 33;
 static constexpr int PIN_TOUCH_IRQ = 36;
 static constexpr int PIN_LDR = 34;
 static constexpr int MAX_HEADLINES = 32;
-static constexpr int MAX_NEWS_ARTICLES = 6;
-static constexpr int NEWS_IMAGE_SOURCE_W = 128;
-static constexpr int NEWS_IMAGE_SOURCE_H = 72;
+static constexpr int MAX_NEWS_ARTICLES = 24;
 static constexpr int NEWS_IMAGE_W = 96;
 static constexpr int NEWS_IMAGE_H = 54;
-static constexpr int NEWS_IMAGE_SOURCE_PIXELS = NEWS_IMAGE_SOURCE_W * NEWS_IMAGE_SOURCE_H;
 static constexpr int NEWS_IMAGE_PIXELS = NEWS_IMAGE_W * NEWS_IMAGE_H;
+static constexpr uint32_t NEWS_CACHE_MAX_AGE_SEC = 3UL * 24UL * 60UL * 60UL;
 static constexpr int MAX_TIDE_POINTS = 49;
 static constexpr int MAX_TIDE_FUTURE = 96;
 static constexpr int MAX_TIDE_EVENTS = 6;
@@ -93,7 +92,6 @@ struct Stats {
 };
 
 struct NewsArticle {
-  String title, summary, source, link;
   bool imageReady = false;
 };
 
@@ -154,7 +152,9 @@ struct Marine {
 Config cfg;
 Stats stats;
 Feed feed;
-uint16_t newsImages[MAX_NEWS_ARTICLES][NEWS_IMAGE_PIXELS];
+uint16_t newsImageBuffer[NEWS_IMAGE_PIXELS];
+bool newsCardReady = false;
+SPIClass newsCardSPI(VSPI);
 Tide tide;
 Marine marine;
 
@@ -207,6 +207,7 @@ void drawNewsPage();
 void drawForecastPage();
 void drawTidePage();
 void drawMarinePage();
+void drawSunMoonPage();
 void drawPcPage();
 void drawPcMetrics();
 void drawSystemPage();
@@ -471,9 +472,7 @@ void drawStatusLine() {
   tft.setTextDatum(TL_DATUM);
   tft.setTextFont(1);
   tft.setTextColor(C_ACC, C_BG);
-  tft.drawString("NEWS", 8, 228);
-  tft.setTextColor(C_DIM, C_BG);
-  tft.drawString(fitText(feed.source.length() ? feed.source : "feed", 220, 1), 44, 228);
+  tft.drawString("Top Stories", 8, 228);
 
   tft.setTextDatum(TR_DATUM);
   String s = ipString();
@@ -547,7 +546,11 @@ bool decodeNewsImage(const String& encoded, uint16_t* destination) {
   size_t sourceByte = 0;
   uint8_t lowByte = 0;
   int value = 0, bits = -8;
-  for (size_t i = 0; i < encoded.length() && sourceByte < NEWS_IMAGE_SOURCE_PIXELS * 2; i++) {
+  // The agent sends exactly one base64-encoded RGB565 little-endian pixel
+  // buffer at the display size. Decode directly into the TFT buffer: an
+  // extra 128x72 -> 96x54 remap both wasted RAM and made the thumbnail look
+  // blocky when adjacent source pixels landed on the same output pixel.
+  for (size_t i = 0; i < encoded.length() && sourceByte < NEWS_IMAGE_PIXELS * 2; i++) {
     int decoded = base64Value(encoded[i]);
     if (decoded < 0) continue;
     value = (value << 6) | decoded;
@@ -558,27 +561,78 @@ bool decodeNewsImage(const String& encoded, uint16_t* destination) {
         lowByte = byte;
       } else {
         size_t pixel = sourceByte / 2;
-        int sourceX = (int)(pixel % NEWS_IMAGE_SOURCE_W);
-        int sourceY = (int)(pixel / NEWS_IMAGE_SOURCE_W);
-        int x = sourceX * NEWS_IMAGE_W / NEWS_IMAGE_SOURCE_W;
-        int y = sourceY * NEWS_IMAGE_H / NEWS_IMAGE_SOURCE_H;
-        // TFT_eSPI streams image buffers byte-for-byte on ESP32. Keep the
-        // high RGB565 byte first so the panel receives the correct colours.
-        destination[y * NEWS_IMAGE_W + x] = ((uint16_t)byte << 8) | lowByte;
+        destination[pixel] = ((uint16_t)byte << 8) | lowByte;
       }
       sourceByte++;
       bits -= 8;
     }
   }
-  return sourceByte == NEWS_IMAGE_SOURCE_PIXELS * 2;
+  return sourceByte == NEWS_IMAGE_PIXELS * 2;
 }
 
-int drawWrappedText(const String& text, int x, int y, int width, int maxLines, uint16_t color) {
+String newsImagePath(int index) {
+  return "/news" + String(index) + ".rgb565";
+}
+
+String newsArticlePath(int index) {
+  return "/article" + String(index) + ".json";
+}
+
+bool loadNewsArticle(int index, String& title, String& summary, String& source) {
+  if (!newsCardReady || index < 0 || index >= feed.articleCount) return false;
+  File article = SD.open(newsArticlePath(index), FILE_READ);
+  if (!article) return false;
+  String json = article.readString();
+  article.close();
+  JsonDocument stored;
+  if (deserializeJson(stored, json)) return false;
+  title = stored["title"] | "";
+  summary = stored["summary"] | "";
+  source = stored["source"] | "News";
+  return title.length() > 0;
+}
+
+void cleanupNewsCache() {
+  if (!newsCardReady) return;
+  time_t now = time(nullptr);
+  if (now < 1700000000) return; // Wait until the clock has been synchronised.
+  for (int i = 0; i < MAX_NEWS_ARTICLES; i++) {
+    String path = newsArticlePath(i);
+    File article = SD.open(path, FILE_READ);
+    if (!article) {
+      SD.remove(newsImagePath(i));
+      continue;
+    }
+    String json = article.readString();
+    article.close();
+    JsonDocument stored;
+    uint32_t savedAt = 0;
+    if (!deserializeJson(stored, json)) savedAt = stored["saved_at"] | 0UL;
+    if (savedAt && (uint32_t)now > savedAt && (uint32_t)now - savedAt > NEWS_CACHE_MAX_AGE_SEC) {
+      SD.remove(path);
+      SD.remove(newsImagePath(i));
+    }
+  }
+}
+
+bool loadNewsImage(int index) {
+  if (!newsCardReady || index < 0 || index >= feed.articleCount) return false;
+  File image = SD.open(newsImagePath(index), FILE_READ);
+  if (!image || image.size() != sizeof(newsImageBuffer)) {
+    if (image) image.close();
+    return false;
+  }
+  size_t read = image.read((uint8_t*)newsImageBuffer, sizeof(newsImageBuffer));
+  image.close();
+  return read == sizeof(newsImageBuffer);
+}
+
+int drawWrappedText(const String& text, int x, int y, int width, int maxLines, uint16_t color, uint16_t background = C_BG) {
   String line;
   int lines = 0;
   tft.setTextDatum(TL_DATUM);
   tft.setTextFont(1);
-  tft.setTextColor(color, C_BG);
+  tft.setTextColor(color, background);
   int start = 0;
   while (start < text.length() && lines < maxLines) {
     while (start < text.length() && text[start] == ' ') start++;
@@ -625,16 +679,32 @@ void drawNewsPage() {
       (int)(((millis() - feed.articleAt) / 30000UL) % feed.articleCount);
     lastNewsArticleSlot = (millis() - feed.articleAt) / 30000UL;
     NewsArticle& article = feed.articles[articleIndex];
-    if (article.imageReady) tft.pushImage(216, 32, NEWS_IMAGE_W, NEWS_IMAGE_H, newsImages[articleIndex]);
-    else tft.fillRoundRect(216, 32, NEWS_IMAGE_W, NEWS_IMAGE_H, 4, C_PANEL);
+    String title, summary, source;
+    if (!loadNewsArticle(articleIndex, title, summary, source)) {
+      title = "News article"; summary = "Article text is not available."; source = "News";
+    }
+    // Keep the complete article together as a single card so the image,
+    // headline and summary have a clear visual boundary on the small screen.
+    tft.fillRoundRect(6, 30, 308, 185, 8, C_PANEL);
+    tft.drawRoundRect(6, 30, 308, 185, 8, C_LINE);
+    if (article.imageReady && loadNewsImage(articleIndex)) {
+      // RGB565 values arrive in the ESP32's native uint16_t representation,
+      // while the ILI9341 expects each pixel's high byte first on SPI.
+      // TFT_eSPI's swap path handles that boundary; without it, adjacent
+      // pixels become the coloured-noise pattern seen on the display.
+      bool previousSwap = tft.getSwapBytes();
+      tft.setSwapBytes(true);
+      tft.pushImage(210, 40, NEWS_IMAGE_W, NEWS_IMAGE_H, newsImageBuffer);
+      tft.setSwapBytes(previousSwap);
+    } else tft.fillRect(210, 40, NEWS_IMAGE_W, NEWS_IMAGE_H, C_PANEL);
     tft.setTextDatum(TL_DATUM);
     tft.setTextFont(2);
-    tft.setTextColor(C_TEXT, C_BG);
-    drawWrappedText(article.title, 8, 32, 166, 3, C_TEXT);
+    tft.setTextColor(C_TEXT, C_PANEL);
+    drawWrappedText(title, 14, 40, 190, 3, C_TEXT, C_PANEL);
     tft.setTextFont(1);
-    tft.setTextColor(C_ACC, C_BG);
-    tft.drawString(fitText(article.source, 166, 1), 8, 84);
-    drawWrappedText(article.summary, 8, 112, 304, 8, C_TEXT);
+    tft.setTextColor(C_ACC, C_PANEL);
+    tft.drawString(fitText(source, 190, 1), 14, 94);
+    drawWrappedText(summary, 14, 114, 292, 7, C_TEXT, C_PANEL);
     tft.setTextColor(C_DIM, C_BG);
     tft.setTextDatum(TL_DATUM);
     tft.drawString("ARTICLE " + String(articleIndex + 1) + "/" + String(feed.articleCount), 8, 222);
@@ -997,6 +1067,72 @@ void drawMarinePage() {
   tft.drawString(fitText(astronomy,286,1),17,215);
 }
 
+int clockMinutes(const String& value) {
+  if (value.length() < 5 || value[2] != ':') return -1;
+  int hour = value.substring(0, 2).toInt();
+  int minute = value.substring(3, 5).toInt();
+  return (hour >= 0 && hour < 24 && minute >= 0 && minute < 60) ? hour * 60 + minute : -1;
+}
+
+void drawMoonGraphic(int cx, int cy, int radius, const String& phase, int illumination) {
+  tft.fillCircle(cx, cy, radius, C_LINE);
+  if (illumination < 5) return;
+  if (illumination > 95) { tft.fillCircle(cx, cy, radius, C_TEXT); return; }
+  bool waxing = phase.startsWith("Waxing") || phase == "First quarter";
+  if (illumination >= 45 && illumination <= 55) {
+    tft.fillRect(waxing ? cx : cx - radius, cy - radius, radius, radius * 2, C_TEXT);
+    return;
+  }
+  tft.fillCircle(cx, cy, radius, C_TEXT);
+  int offset = max(2, (int)(radius * (1.0f - illumination / 50.0f)));
+  if (illumination > 50) offset = max(2, (int)(radius * ((illumination - 50.0f) / 50.0f)));
+  tft.fillCircle(cx + (waxing ? offset : -offset), cy, radius, C_LINE);
+}
+
+void drawSunMoonPage() {
+  tft.fillScreen(C_BG); drawPageHeader("SUN & MOON", marine.station.length() ? marine.station : cfg.city);
+  if (!marine.valid) {
+    tft.setTextDatum(MC_DATUM); tft.setTextFont(2); tft.setTextColor(C_DIM, C_BG);
+    tft.drawString("Waiting for astronomy data", 160, 118);
+    return;
+  }
+
+  int sunrise = clockMinutes(marine.sunrise);
+  int sunset = clockMinutes(marine.sunset);
+  time_t now = time(nullptr);
+  struct tm local;
+  localtime_r(&now, &local);
+  int current = local.tm_hour * 60 + local.tm_min;
+  bool daylight = sunrise >= 0 && sunset >= 0 && current >= sunrise && current < sunset;
+  int daylightMinutes = sunrise >= 0 && sunset >= 0 ? sunset - sunrise : -1;
+
+  tft.fillRoundRect(8, 38, 148, 80, 8, C_PANEL);
+  tft.fillRoundRect(164, 38, 148, 80, 8, C_PANEL);
+  tft.setTextDatum(TL_DATUM); tft.setTextFont(1); tft.setTextColor(C_DIM, C_PANEL);
+  tft.drawString("SUN", 18, 46); tft.drawString("MOON", 174, 46);
+  drawSunIcon(42, 78, 10);
+  drawMoonGraphic(198, 78, 18, marine.moon, marine.moonIllumination);
+  tft.setTextColor(C_TEXT, C_PANEL); tft.setTextFont(2);
+  tft.drawString("UP  "+(marine.sunrise.length()?marine.sunrise:"--:--"), 62, 66);
+  tft.drawString("DOWN "+(marine.sunset.length()?marine.sunset:"--:--"), 62, 88);
+  tft.drawString(fitText(marine.moon.length()?marine.moon:"Unknown", 118, 2), 222, 68);
+  tft.setTextFont(1); tft.setTextColor(C_ACC, C_PANEL);
+  tft.drawString(marine.moonIllumination >= 0 ? String(marine.moonIllumination)+"% illuminated" : "-- illumination", 222, 94);
+
+  tft.fillRoundRect(8, 126, 304, 72, 8, C_PANEL);
+  tft.setTextDatum(TL_DATUM); tft.setTextFont(1); tft.setTextColor(C_DIM, C_PANEL);
+  tft.drawString("TODAY", 17, 134); tft.drawString("DAYLIGHT", 17, 158); tft.drawString("STATUS", 17, 180);
+  tft.setTextDatum(TR_DATUM); tft.setTextColor(C_TEXT, C_PANEL);
+  String duration = daylightMinutes >= 0 ? String(daylightMinutes / 60) + "h " + String(daylightMinutes % 60) + "m" : "--";
+  tft.drawString(duration, 303, 158);
+  tft.setTextColor(daylight ? C_SUN : C_DIM, C_PANEL);
+  tft.drawString(daylight ? "DAYLIGHT" : "NIGHT", 303, 180);
+
+  tft.fillRoundRect(8, 206, 304, 26, 7, C_PANEL);
+  tft.setTextDatum(TL_DATUM); tft.setTextColor(C_DIM, C_PANEL);
+  tft.drawString("LOCAL TIME  "+String(local.tm_hour < 10 ? "0" : "")+String(local.tm_hour)+":"+String(local.tm_min < 10 ? "0" : "")+String(local.tm_min), 17, 215);
+}
+
 void drawPcPage() {
   tft.fillScreen(C_BG);drawPageHeader("PC DETAILS",stats.host.length()?stats.host:"AGENT OFFLINE");
   drawMetricCard(8,38,148,76,"PROCESSOR",stats.cpu<0?"--":String(stats.cpu,0)+"%",stats.cpuTemp<0?"Temperature --":fmtTemp(stats.cpuTemp),C_ACC);
@@ -1026,6 +1162,7 @@ void drawPage(bool full) {
   else if (page == 3) drawTidePage();
   else if (page == 4) drawMarinePage();
   else if (page == 5) drawPcPage();
+  else if (page == 6) drawSunMoonPage();
   else drawSystemPage();
   lastStatsMs = millis();
 }
@@ -1193,6 +1330,7 @@ void handleFeed() {
     server.send(400, "application/json", "{\"ok\":false}");
     return;
   }
+  cleanupNewsCache();
   feed.city = doc["city"] | "";
   feed.source = doc["source"] | "";
   feed.units = doc["units"] | "metric";
@@ -1213,10 +1351,19 @@ void handleFeed() {
   for (JsonObject article : doc["articles"].as<JsonArray>()) {
     if (feed.articleCount >= MAX_NEWS_ARTICLES) break;
     int i = feed.articleCount++;
-    feed.articles[i].title = article["title"] | "";
-    feed.articles[i].summary = article["summary"] | "";
-    feed.articles[i].source = article["source"] | feed.source;
-    feed.articles[i].link = article["link"] | "";
+    if (newsCardReady) {
+      JsonDocument stored;
+      stored["title"] = article["title"] | "";
+      stored["summary"] = article["summary"] | "";
+      stored["source"] = article["source"] | feed.source;
+      stored["link"] = article["link"] | "";
+      time_t savedAt = time(nullptr);
+      if (savedAt >= 1700000000) stored["saved_at"] = (uint32_t)savedAt;
+      String path = newsArticlePath(i);
+      SD.remove(path);
+      File saved = SD.open(path, FILE_WRITE);
+      if (saved) { serializeJson(stored, saved); saved.close(); }
+    }
     feed.articles[i].imageReady = false;
   }
   feed.forecastCount = 0;
@@ -1240,14 +1387,23 @@ void handleFeed() {
 
 void handleNewsImage() {
   int index = server.arg("i").toInt();
-  if (index < 0 || index >= feed.articleCount) {
+  if (index < 0 || index >= feed.articleCount || !newsCardReady) {
     server.send(400, "application/json", "{\"ok\":false}");
     return;
   }
-  if (!decodeNewsImage(server.arg("plain"), newsImages[index])) {
+  if (!decodeNewsImage(server.arg("plain"), newsImageBuffer)) {
     server.send(400, "application/json", "{\"ok\":false}");
     return;
   }
+  String path = newsImagePath(index);
+  SD.remove(path);
+  File image = SD.open(path, FILE_WRITE);
+  if (!image || image.write((const uint8_t*)newsImageBuffer, sizeof(newsImageBuffer)) != sizeof(newsImageBuffer)) {
+    if (image) image.close();
+    server.send(500, "application/json", "{\"ok\":false}");
+    return;
+  }
+  image.close();
   feed.articles[index].imageReady = true;
   feedDirty = true;
   server.send(200, "application/json", "{\"ok\":true}");
@@ -1379,15 +1535,15 @@ void handleTouch() {
   if (!touchRead()) return;
   lastTouchMs = millis();
   lastPageChange = millis();
-  page = (page + 1) % 7;
+  page = (page + 1) % 8;
   drawPage(true);
 }
 
 void updateDisplay() {
   uint32_t now = millis();
   updateBacklight();
-  if (cfg.autoRotate && page != 6 && now - lastPageChange >= (uint32_t)cfg.rotateMinutes * 60000UL) {
-    page = (page + 1) % 6; lastPageChange = now; drawPage(true);
+  if (cfg.autoRotate && page != 7 && now - lastPageChange >= (uint32_t)cfg.rotateMinutes * 60000UL) {
+    page = (page + 1) % 7; lastPageChange = now; drawPage(true);
   }
   if (displaySleeping) return;
   if (page == 0) {
@@ -1423,6 +1579,8 @@ void updateDisplay() {
     if (now-lastMarineMs>=60000 && marine.valid) {lastMarineMs=now;drawMarinePage();}
   } else if (page == 5) {
     if (now-lastPcMs>=3000) {lastPcMs=now;drawPcMetrics();}
+  } else if (page == 6) {
+    if (now-lastMarineMs>=60000 && marine.valid) {lastMarineMs=now;drawSunMoonPage();}
   } else {
     if (now - lastSysMs >= 2000) { lastSysMs = now; drawSystemPage(); }
   }
@@ -1460,6 +1618,11 @@ void setup() {
   touchSPI.begin(25, 39, 32, PIN_TOUCH_CS);
   pinMode(PIN_TOUCH_CS, OUTPUT);
   digitalWrite(PIN_TOUCH_CS, HIGH);
+
+  newsCardSPI.begin(18, 19, 23, 5);
+  newsCardReady = SD.begin(5, newsCardSPI);
+  cleanupNewsCache();
+  Serial.printf("News SD card: %s\n", newsCardReady ? "ready" : "not available");
 
   ticker.setColorDepth(16);
   tickerReady = ticker.createSprite(320, 45) != nullptr;

@@ -15,6 +15,7 @@ import json
 import math
 import os
 import platform
+import random
 import re
 import socket
 import struct
@@ -51,9 +52,11 @@ CONFIG_FILE = Path(__file__).with_name("agent.json")
 STATE = {"host": None, "lock": None, "net": None, "net_at": None}
 DEFAULT_TIDE_STATION = "E73424"
 TIDE_LOCATION_CACHE = {}
-NEWS_IMAGE_W = 128
-NEWS_IMAGE_H = 72
-NEWS_ARTICLE_LIMIT = 6
+# Keep the wire format identical to the CYD framebuffer. Sending the final
+# display size avoids a second nearest-neighbour resize on the ESP32.
+NEWS_IMAGE_W = 96
+NEWS_IMAGE_H = 54
+NEWS_ARTICLE_LIMIT = 24
 NEWS_ITEM_LIMIT = 32
 NEWS_IMAGE_CACHE = {}
 NEWS_ARTICLE_CACHE = {}
@@ -758,6 +761,10 @@ def fetch_news_feeds(value, limit=NEWS_ITEM_LIMIT, article_limit=NEWS_ARTICLE_LI
             if len(selected) >= limit:
                 break
         index += 1
+
+    # Vary the article sequence on each refresh so the dashboard does not
+    # always show the same feed/source order.
+    random.shuffle(selected)
 
     sources = []
     for _, source in results:

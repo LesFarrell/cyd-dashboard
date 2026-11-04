@@ -178,6 +178,7 @@ uint32_t lastStatsMs = 0;
 uint32_t lastTickerMs = 0;
 uint32_t lastNewsMs = 0;
 uint32_t lastNewsArticleSlot = 0;
+uint32_t lastNewsImageMs = 0;
 uint32_t lastForecastMs = 0;
 uint32_t lastTideMs = 0, lastMarineMs = 0, lastPcMs = 0;
 uint32_t lastSysMs = 0;
@@ -1501,6 +1502,7 @@ void handleFeed() {
   feed.at = millis();
   feed.articleAt = feed.at;
   lastNewsArticleSlot = 0;
+  lastNewsImageMs = millis();
   buildTicker();
   feedDirty = true;
   server.send(200, "application/json", "{\"ok\":true}");
@@ -1526,6 +1528,7 @@ void handleNewsImage() {
   }
   image.close();
   feed.articles[index].imageReady = true;
+  lastNewsImageMs = millis();
   feedDirty = true;
   server.send(200, "application/json", "{\"ok\":true}");
 }
@@ -1747,7 +1750,7 @@ void updateDisplay() {
     }
     drawTickerStep();
   } else if (page == 1) {
-    if (feedDirty) { feedDirty=false; drawNewsPage(); }
+    if (feedDirty && now - lastNewsImageMs >= 700) { feedDirty=false; drawNewsPage(); }
     else if (feed.articleCount > 1 && (now - feed.articleAt) / 30000UL != lastNewsArticleSlot) drawNewsPage();
   } else if (page == 2) {
     if (feedDirty) { feedDirty=false; drawForecastPage(); }

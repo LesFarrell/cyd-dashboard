@@ -562,7 +562,9 @@ bool decodeNewsImage(const String& encoded, uint16_t* destination) {
         int sourceY = (int)(pixel / NEWS_IMAGE_SOURCE_W);
         int x = sourceX * NEWS_IMAGE_W / NEWS_IMAGE_SOURCE_W;
         int y = sourceY * NEWS_IMAGE_H / NEWS_IMAGE_SOURCE_H;
-        destination[y * NEWS_IMAGE_W + x] = (uint16_t)lowByte | ((uint16_t)byte << 8);
+        // TFT_eSPI streams image buffers byte-for-byte on ESP32. Keep the
+        // high RGB565 byte first so the panel receives the correct colours.
+        destination[y * NEWS_IMAGE_W + x] = ((uint16_t)byte << 8) | lowByte;
       }
       sourceByte++;
       bits -= 8;
@@ -577,21 +579,21 @@ int drawWrappedText(const String& text, int x, int y, int width, int maxLines, u
   tft.setTextDatum(TL_DATUM);
   tft.setTextFont(1);
   tft.setTextColor(color, C_BG);
-  for (int i = 0; i <= text.length() && lines < maxLines; i++) {
-    char c = i < text.length() ? text[i] : ' ';
-    if (c == '\n' || c == ' ' || i == text.length()) {
-      String candidate = line;
-      if (c != ' ' && i < text.length()) candidate += c;
-      if (tft.textWidth(candidate, 1) <= width) {
-        line = candidate;
-      } else if (line.length()) {
-        tft.drawString(line, x, y + lines * 12);
-        lines++;
-        line = (c == ' ') ? "" : String(c);
-      }
+  int start = 0;
+  while (start < text.length() && lines < maxLines) {
+    while (start < text.length() && text[start] == ' ') start++;
+    int end = text.indexOf(' ', start);
+    if (end < 0) end = text.length();
+    String word = text.substring(start, end);
+    String candidate = line.length() ? line + " " + word : word;
+    if (!line.length() || tft.textWidth(candidate, 1) <= width) {
+      line = candidate;
     } else {
-      line += c;
+      tft.drawString(line, x, y + lines * 12);
+      lines++;
+      line = word;
     }
+    start = end + 1;
   }
   if (line.length() && lines < maxLines) {
     tft.drawString(fitText(line, width, 1), x, y + lines * 12);

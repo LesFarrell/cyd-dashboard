@@ -24,7 +24,12 @@ static constexpr int MAX_NEWS_ARTICLES = 24;
 static constexpr int NEWS_IMAGE_W = 96;
 static constexpr int NEWS_IMAGE_H = 54;
 static constexpr int NEWS_IMAGE_PIXELS = NEWS_IMAGE_W * NEWS_IMAGE_H;
+static constexpr int ASSET_IMAGE_W = 54;
+static constexpr int ASSET_IMAGE_H = 54;
+static constexpr int ASSET_IMAGE_PIXELS = ASSET_IMAGE_W * ASSET_IMAGE_H;
 static constexpr uint32_t NEWS_CACHE_MAX_AGE_SEC = 3UL * 24UL * 60UL * 60UL;
+static constexpr uint32_t TIDE_CACHE_MAX_AGE_SEC = 6UL * 60UL * 60UL;
+static constexpr uint32_t MARINE_CACHE_MAX_AGE_SEC = 24UL * 60UL * 60UL;
 static constexpr int MAX_TIDE_POINTS = 49;
 static constexpr int MAX_TIDE_FUTURE = 96;
 static constexpr int MAX_TIDE_EVENTS = 6;
@@ -153,6 +158,7 @@ Config cfg;
 Stats stats;
 Feed feed;
 uint16_t newsImageBuffer[NEWS_IMAGE_PIXELS];
+uint16_t assetImageBuffer[ASSET_IMAGE_PIXELS];
 bool newsCardReady = false;
 SPIClass newsCardSPI(VSPI);
 Tide tide;
@@ -209,6 +215,7 @@ void drawTidePage();
 void drawMarinePage();
 void drawSunMoonPage();
 void drawPcPage();
+bool drawWeatherAsset(int code, int x, int y);
 void drawPcMetrics();
 void drawSystemPage();
 void drawQr(const String& text, int x, int y);
@@ -615,6 +622,35 @@ void cleanupNewsCache() {
   }
 }
 
+bool saveDataCache(const char* path, JsonDocument& doc) {
+  if (!newsCardReady) return false;
+  time_t now = time(nullptr);
+  if (now < 1700000000) return false;
+  doc["cached_at"] = (uint32_t)now;
+  SD.remove(path);
+  File file = SD.open(path, FILE_WRITE);
+  if (!file) return false;
+  serializeJson(doc, file);
+  file.close();
+  return true;
+}
+
+bool loadDataCache(const char* path, JsonDocument& doc, uint32_t maxAge) {
+  if (!newsCardReady) return false;
+  File file = SD.open(path, FILE_READ);
+  if (!file) return false;
+  String json = file.readString();
+  file.close();
+  if (deserializeJson(doc, json)) { SD.remove(path); return false; }
+  time_t now = time(nullptr);
+  uint32_t cachedAt = doc["cached_at"] | 0UL;
+  if (now < 1700000000 || !cachedAt || (uint32_t)now < cachedAt || (uint32_t)now - cachedAt > maxAge) {
+    SD.remove(path);
+    return false;
+  }
+  return true;
+}
+
 bool loadNewsImage(int index) {
   if (!newsCardReady || index < 0 || index >= feed.articleCount) return false;
   File image = SD.open(newsImagePath(index), FILE_READ);
@@ -625,6 +661,50 @@ bool loadNewsImage(int index) {
   size_t read = image.read((uint8_t*)newsImageBuffer, sizeof(newsImageBuffer));
   image.close();
   return read == sizeof(newsImageBuffer);
+}
+
+String assetPath(const String& name) {
+  if (name == "sun") return "/sun.rgb565";
+  if (name.startsWith("moon") || name.startsWith("weather")) {
+    int split = name.startsWith("moon") ? 4 : 7;
+    int index = name.substring(split).toInt();
+    int maxIndex = name.startsWith("moon") ? 7 : 7;
+    if (index >= 0 && index <= maxIndex) return "/" + name + ".rgb565";
+  }
+  return "";
+}
+
+bool loadAssetImage(const String& name) {
+  String path = assetPath(name);
+  if (!newsCardReady || !path.length()) return false;
+  File image = SD.open(path, FILE_READ);
+  if (!image || image.size() != sizeof(assetImageBuffer)) {
+    if (image) image.close();
+    return false;
+  }
+  size_t read = image.read((uint8_t*)assetImageBuffer, sizeof(assetImageBuffer));
+  image.close();
+  return read == sizeof(assetImageBuffer);
+}
+
+bool decodeAssetImage(const String& encoded) {
+  size_t sourceByte = 0;
+  uint8_t lowByte = 0;
+  int value = 0, bits = -8;
+  for (size_t i = 0; i < encoded.length() && sourceByte < ASSET_IMAGE_PIXELS * 2; i++) {
+    int decoded = base64Value(encoded[i]);
+    if (decoded < 0) continue;
+    value = (value << 6) | decoded;
+    bits += 6;
+    if (bits >= 0) {
+      uint8_t byte = (uint8_t)((value >> bits) & 0xFF);
+      if ((sourceByte & 1) == 0) lowByte = byte;
+      else assetImageBuffer[sourceByte / 2] = ((uint16_t)byte << 8) | lowByte;
+      sourceByte++;
+      bits -= 8;
+    }
+  }
+  return sourceByte == ASSET_IMAGE_PIXELS * 2;
 }
 
 int drawWrappedText(const String& text, int x, int y, int width, int maxLines, uint16_t color, uint16_t background = C_BG) {
@@ -681,7 +761,9 @@ void drawNewsPage() {
     NewsArticle& article = feed.articles[articleIndex];
     String title, summary, source;
     if (!loadNewsArticle(articleIndex, title, summary, source)) {
-      title = "News article"; summary = "Article text is not available."; source = "News";
+      title = articleIndex < feed.count ? feed.headlines[articleIndex] : "Top Story";
+      summary = newsCardReady ? "Article details are being cached." : "Insert a FAT32 SD card to cache article details and images.";
+      source = "Top Stories";
     }
     // Keep the complete article together as a single card so the image,
     // headline and summary have a clear visual boundary on the small screen.
@@ -817,7 +899,7 @@ void drawForecastPage() {
     return;
   }
 
-  drawWeatherIcon(feed.code, 42, 62, 2);
+  if (!drawWeatherAsset(feed.code, 15, 36)) drawWeatherIcon(feed.code, 42, 62, 2);
   tft.setTextDatum(TL_DATUM);
   tft.setTextFont(4);
   tft.setTextColor(C_TEXT, C_BG);
@@ -843,7 +925,7 @@ void drawForecastPage() {
     tft.setTextFont(2);
     tft.setTextColor(i == 0 ? C_ACC : C_TEXT, C_PANEL);
     tft.drawString(feed.forecastDay[i], x + 36, 126);
-    drawWeatherIcon(feed.forecastCode[i], x + 36, 161, 1);
+    if (!drawWeatherAsset(feed.forecastCode[i], x + 9, 143)) drawWeatherIcon(feed.forecastCode[i], x + 36, 161, 1);
 
     tft.setTextDatum(TC_DATUM);
     tft.setTextFont(2);
@@ -1089,6 +1171,39 @@ void drawMoonGraphic(int cx, int cy, int radius, const String& phase, int illumi
   tft.fillCircle(cx + (waxing ? offset : -offset), cy, radius, C_LINE);
 }
 
+int moonAssetIndex(const String& phase) {
+  if (phase == "New moon") return 0;
+  if (phase == "Waxing crescent") return 1;
+  if (phase == "First quarter") return 2;
+  if (phase == "Waxing gibbous") return 3;
+  if (phase == "Full moon") return 4;
+  if (phase == "Waning gibbous") return 5;
+  if (phase == "Last quarter") return 6;
+  if (phase == "Waning crescent") return 7;
+  return -1;
+}
+
+int weatherAssetIndex(int code) {
+  if (code == 0) return 0;
+  if (code == 1 || code == 2) return 1;
+  if (code == 3) return 2;
+  if (code == 45 || code == 48) return 3;
+  if (code >= 71 && code <= 77 || code == 85 || code == 86) return 6;
+  if (code >= 95) return 7;
+  if (code >= 61 && code <= 67 || code >= 80 && code <= 82) return 5;
+  return 4;
+}
+
+bool drawWeatherAsset(int code, int x, int y) {
+  String name = "weather" + String(weatherAssetIndex(code));
+  if (!loadAssetImage(name)) return false;
+  bool previousSwap = tft.getSwapBytes();
+  tft.setSwapBytes(true);
+  tft.pushImage(x, y, ASSET_IMAGE_W, ASSET_IMAGE_H, assetImageBuffer);
+  tft.setSwapBytes(previousSwap);
+  return true;
+}
+
 void drawSunMoonPage() {
   tft.fillScreen(C_BG); drawPageHeader("SUN & MOON", marine.station.length() ? marine.station : cfg.city);
   if (!marine.valid) {
@@ -1111,13 +1226,19 @@ void drawSunMoonPage() {
   tft.setTextDatum(TL_DATUM); tft.setTextFont(1); tft.setTextColor(C_DIM, C_PANEL);
   tft.drawString("SUN", 18, 46); tft.drawString("MOON", 174, 46);
   drawSunIcon(42, 78, 10);
-  drawMoonGraphic(198, 78, 18, marine.moon, marine.moonIllumination);
+  if (!loadAssetImage("moon" + String(moonAssetIndex(marine.moon)))) drawMoonGraphic(198, 78, 18, marine.moon, marine.moonIllumination);
+  else {
+    bool previousSwap = tft.getSwapBytes();
+    tft.setSwapBytes(true);
+    tft.pushImage(171, 52, ASSET_IMAGE_W, ASSET_IMAGE_H, assetImageBuffer);
+    tft.setSwapBytes(previousSwap);
+  }
   tft.setTextColor(C_TEXT, C_PANEL); tft.setTextFont(2);
-  tft.drawString("UP  "+(marine.sunrise.length()?marine.sunrise:"--:--"), 62, 66);
-  tft.drawString("DOWN "+(marine.sunset.length()?marine.sunset:"--:--"), 62, 88);
-  tft.drawString(fitText(marine.moon.length()?marine.moon:"Unknown", 118, 2), 222, 68);
+  tft.drawString("RISE  "+(marine.sunrise.length()?marine.sunrise:"--:--"), 68, 66);
+  tft.drawString("SET   "+(marine.sunset.length()?marine.sunset:"--:--"), 68, 88);
+  tft.drawString(fitText(marine.moon.length()?marine.moon:"Unknown", 86, 2), 222, 68);
   tft.setTextFont(1); tft.setTextColor(C_ACC, C_PANEL);
-  tft.drawString(marine.moonIllumination >= 0 ? String(marine.moonIllumination)+"% illuminated" : "-- illumination", 222, 94);
+  tft.drawString(fitText(marine.moonIllumination >= 0 ? String(marine.moonIllumination)+"% illuminated" : "-- illumination", 86, 1), 222, 94);
 
   tft.fillRoundRect(8, 126, 304, 72, 8, C_PANEL);
   tft.setTextDatum(TL_DATUM); tft.setTextFont(1); tft.setTextColor(C_DIM, C_PANEL);
@@ -1409,8 +1530,52 @@ void handleNewsImage() {
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
-void handleTide() {
-  JsonDocument doc; if(deserializeJson(doc,server.arg("plain"))){server.send(400,"application/json","{\"ok\":false}");return;}
+void handleAssetImage() {
+  String name = server.arg("name");
+  String path = assetPath(name);
+  if (!newsCardReady || !path.length() || !decodeAssetImage(server.arg("plain"))) {
+    server.send(400, "application/json", "{\"ok\":false}"); return;
+  }
+  SD.remove(path);
+  File image = SD.open(path, FILE_WRITE);
+  if (!image || image.write((const uint8_t*)assetImageBuffer, sizeof(assetImageBuffer)) != sizeof(assetImageBuffer)) {
+    if (image) image.close();
+    server.send(500, "application/json", "{\"ok\":false}"); return;
+  }
+  image.close();
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleSdGet() {
+  JsonDocument doc;
+  doc["ready"] = newsCardReady;
+  doc["totalMb"] = newsCardReady ? (uint32_t)(SD.totalBytes() / (1024 * 1024)) : 0;
+  doc["usedMb"] = newsCardReady ? (uint32_t)(SD.usedBytes() / (1024 * 1024)) : 0;
+  int assets = 0;
+  if (newsCardReady) {
+    if (SD.exists("/sun.rgb565")) assets++;
+    for (int i = 0; i < 8; i++) {
+      if (SD.exists(("/moon" + String(i) + ".rgb565").c_str())) assets++;
+      if (SD.exists(("/weather" + String(i) + ".rgb565").c_str())) assets++;
+    }
+  }
+  doc["assetCount"] = assets;
+  String out; serializeJson(doc, out); server.send(200, "application/json", out);
+}
+
+void handleSdPost() {
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain")) || !doc["format"].as<bool>()) {
+    server.send(400, "application/json", "{\"ok\":false}"); return;
+  }
+  SD.end();
+  delay(100);
+  newsCardReady = SD.begin(5, newsCardSPI, 4000000, "/sd", 5, true);
+  if (newsCardReady) cleanupNewsCache();
+  server.send(newsCardReady ? 200 : 500, "application/json", newsCardReady ? "{\"ok\":true}" : "{\"ok\":false}");
+}
+
+void applyTideDocument(JsonDocument& doc) {
   tide.station=doc["station"]|cfg.tidePort; tide.latestTime=doc["latest_time"]|""; tide.latestAge=doc["latest_age"]|0; tide.count=0;
   for(JsonArray row:doc["points"].as<JsonArray>()){if(tide.count>=MAX_TIDE_POINTS)break;int i=tide.count++; tide.minutesAgo[i]=row[0]|0; tide.heights[i]=row[1]|0.0f;}
   tide.eventCount=0; for(JsonArray row:doc["events"].as<JsonArray>()){if(tide.eventCount>=MAX_TIDE_EVENTS)break;int i=tide.eventCount++;tide.eventMinutesAgo[i]=row[0]|0;tide.eventHeight[i]=row[1]|0.0f;tide.eventKind[i]=row[2]|"";tide.eventTime[i]=row[3]|"";}
@@ -1418,15 +1583,25 @@ void handleTide() {
   tide.futureEventCount=0; for(JsonArray row:doc["future_events"].as<JsonArray>()){if(tide.futureEventCount>=MAX_TIDE_FUTURE_EVENTS)break;int i=tide.futureEventCount++;tide.futureEventMinutes[i]=row[0]|0;tide.futureEventHeight[i]=row[1]|0.0f;tide.futureEventKind[i]=row[2]|"";tide.futureEventTime[i]=row[3]|"";}
   tide.latest=tide.count?tide.heights[tide.count-1]:0;tide.valid=tide.count>0;tide.at=millis();
   tide.hasCurrent=!doc["current"].isNull();tide.current=tide.hasCurrent?doc["current"].as<float>():tide.latest;
+}
+
+void handleTide() {
+  JsonDocument doc; if(deserializeJson(doc,server.arg("plain"))){server.send(400,"application/json","{\"ok\":false}");return;}
+  applyTideDocument(doc); saveDataCache("/tide.json", doc);
   server.send(200,"application/json","{\"ok\":true}");
+}
+
+void applyMarineDocument(JsonDocument& doc) {
+  marine.station=doc["station"]|cfg.tidePort;marine.wind=doc["wind"]|-1.0f;marine.windDirection=doc["wind_direction"]|-1.0f;marine.windGust=doc["wind_gust"]|-1.0f;marine.windUnit=doc["wind_unit"]|"";
+  marine.waveHeight=doc["wave_height"]|-1.0f;marine.wavePeriod=doc["wave_period"]|-1.0f;marine.seaTemp=doc["sea_temp"]|-100.0f;marine.currentSpeed=doc["current_speed"]|-1.0f;marine.currentDirection=doc["current_direction"]|-1.0f;
+  marine.sunrise=doc["sunrise"]|"";marine.sunset=doc["sunset"]|"";marine.moon=doc["moon"]|"";marine.moonIllumination=doc["moon_illumination"]|-1;
+  marine.valid=true;marine.at=millis();
 }
 
 void handleMarine() {
   JsonDocument doc; if(deserializeJson(doc,server.arg("plain"))){server.send(400,"application/json","{\"ok\":false}");return;}
-  marine.station=doc["station"]|cfg.tidePort;marine.wind=doc["wind"]|-1.0f;marine.windDirection=doc["wind_direction"]|-1.0f;marine.windGust=doc["wind_gust"]|-1.0f;marine.windUnit=doc["wind_unit"]|"";
-  marine.waveHeight=doc["wave_height"]|-1.0f;marine.wavePeriod=doc["wave_period"]|-1.0f;marine.seaTemp=doc["sea_temp"]|-100.0f;marine.currentSpeed=doc["current_speed"]|-1.0f;marine.currentDirection=doc["current_direction"]|-1.0f;
-  marine.sunrise=doc["sunrise"]|"";marine.sunset=doc["sunset"]|"";marine.moon=doc["moon"]|"";marine.moonIllumination=doc["moon_illumination"]|-1;
-  marine.valid=true;marine.at=millis();server.send(200,"application/json","{\"ok\":true}");
+  applyMarineDocument(doc); saveDataCache("/marine.json", doc);
+  server.send(200,"application/json","{\"ok\":true}");
 }
 
 void handleReboot() {
@@ -1454,6 +1629,9 @@ void setupServer() {
   server.on("/api/stats", HTTP_POST, handleStats);
   server.on("/api/feed", HTTP_POST, handleFeed);
   server.on("/api/newsimage", HTTP_POST, handleNewsImage);
+  server.on("/api/asset", HTTP_POST, handleAssetImage);
+  server.on("/api/sd", HTTP_GET, handleSdGet);
+  server.on("/api/sd", HTTP_POST, handleSdPost);
   server.on("/api/tide", HTTP_POST, handleTide);
   server.on("/api/marine", HTTP_POST, handleMarine);
   server.on("/api/reboot", HTTP_POST, handleReboot);

@@ -152,6 +152,9 @@ input[type=range]{width:100%;accent-color:var(--acc)}
       <button class="ghost" id="rebootBtn">Reboot</button>
       <button class="danger" id="resetBtn">Factory reset</button>
     </div>
+    <div class="hint">SD card: <b id="sdStatus">checking…</b></div>
+    <div class="actions"><button class="ghost" id="sdFormatBtn">Format / initialise SD card</button></div>
+    <div class="msg" id="sdMsg"></div>
     <div class="hint">Factory reset erases WiFi and all settings, then restarts the setup hotspot.</div>
   </section>
 </main>
@@ -276,6 +279,24 @@ $('#saveBtn').onclick=async()=>{
 };
 $('#rebootBtn').onclick=()=>{if(confirm('Reboot the CYD?'))post('/api/reboot').then(()=>toast('Rebooting…'));};
 $('#resetBtn').onclick=()=>{if(confirm('Erase all settings and start the setup hotspot?'))post('/api/reset').then(()=>toast('Resetting…'));};
+async function loadSd(){
+  try{
+    const s=await fetch('/api/sd').then(r=>r.json());
+    $('#sdStatus').textContent=s.ready?`${s.usedMb} / ${s.totalMb} MB used`:'not detected';
+    $('#sdStatus').style.color=s.ready?'var(--ok)':'var(--bad)';
+  }catch(e){$('#sdStatus').textContent='unavailable';$('#sdStatus').style.color='var(--bad)';}
+}
+$('#sdFormatBtn').onclick=async()=>{
+  if(!confirm('Initialise the SD card if it is unformatted? Existing files may be lost if the filesystem must be created.'))return;
+  $('#sdMsg').className='msg';$('#sdMsg').textContent='Initialising…';
+  try{
+    const r=await post('/api/sd',{format:true});
+    $('#sdMsg').className=r.ok?'msg ok':'msg bad';
+    $('#sdMsg').textContent=r.ok?'SD card ready':'SD card could not be mounted';
+    loadSd();
+  }catch(e){$('#sdMsg').className='msg bad';$('#sdMsg').textContent='SD card action failed';}
+};
+loadSd();setInterval(loadSd,5000);
 loadCfg();loadStatus();setInterval(loadStatus,3000);
 </script>
 </body>

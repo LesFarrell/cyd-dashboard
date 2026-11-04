@@ -60,6 +60,8 @@ NEWS_ARTICLE_LIMIT = 24
 NEWS_ITEM_LIMIT = 32
 NEWS_IMAGE_CACHE = {}
 NEWS_ARTICLE_CACHE = {}
+DISPLAY_ASSET_DIR = Path(__file__).with_name("assets") / "cache"
+DISPLAY_ASSET_COUNT = 17
 NEWS_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -808,6 +810,23 @@ def post_news_images(session, host, images, timeout=10):
     return sent
 
 
+def post_display_assets(session, host, timeout=10):
+    sent = 0
+    assets = sorted(DISPLAY_ASSET_DIR.glob("*.b64"))
+    for asset in assets:
+        try:
+            session.post(
+                f"http://{host}/api/asset?name={asset.stem}",
+                data=asset.read_text(encoding="ascii"),
+                headers={"Content-Type": "text/plain"},
+                timeout=timeout,
+            ).raise_for_status()
+            sent += 1
+        except Exception as exc:
+            print(f"  display asset {asset.stem} error: {exc}")
+    return sent == DISPLAY_ASSET_COUNT, sent
+
+
 def stats_loop(interval, no_gpu):
     session = requests.Session()
     misses = 0
@@ -837,6 +856,7 @@ def stats_loop(interval, no_gpu):
 
 def feed_loop(feed_interval):
     session = requests.Session()
+    assets_ready = False
     while True:
         host = STATE["host"]
         try:
@@ -845,6 +865,16 @@ def feed_loop(feed_interval):
             print(f"  config error: {exc}")
             time.sleep(feed_interval)
             continue
+        if not assets_ready:
+            try:
+                sd = session.get(f"http://{host}/api/sd", timeout=5).json()
+                if sd.get("ready") and sd.get("assetCount", 0) < DISPLAY_ASSET_COUNT:
+                    assets_ready, sent_assets = post_display_assets(session, host)
+                    print(f"  display assets: {sent_assets}/{DISPLAY_ASSET_COUNT}")
+                else:
+                    assets_ready = sd.get("assetCount", 0) >= DISPLAY_ASSET_COUNT
+            except Exception as exc:
+                print(f"  display asset sync error: {exc}")
         try:
             tide_station = dev.get("tideStation", DEFAULT_TIDE_STATION)
             tide_port = dev.get("tidePort", "Heysham")
@@ -898,7 +928,7 @@ def main():
     parser = argparse.ArgumentParser(description="CYD dashboard PC agent")
     parser.add_argument("--host", help="CYD IP address (skip auto-discovery)")
     parser.add_argument("--interval", type=float, default=1.0, help="seconds between stats packets")
-    parser.add_argument("--feed-interval", type=float, default=300, help="seconds between weather/news updates")
+    parser.add_argument("--feed-interval", type=float, default=60, help="seconds between weather/news updates")
     parser.add_argument("--no-gpu", action="store_true", help="do not query nvidia-smi")
     parser.add_argument("--discover", action="store_true", help="force a discovery scan")
     parser.add_argument("--once", action="store_true", help="send one stats packet and one feed, then exit")
@@ -931,6 +961,7 @@ def main():
     if args.once:
         session = requests.Session()
         session.post(f"http://{host}/api/stats", json=collect(args.no_gpu), timeout=3)
+        post_display_assets(session, host)
         dev = session.get(f"http://{host}/api/config", timeout=5).json()
         weather = fetch_weather(dev.get("lat", 51.5072), dev.get("lon", -0.1276), dev.get("units", "metric"))
         titles, source, articles, images = fetch_news_feeds(dev.get("feed") or DEFAULT_FEED)

@@ -662,7 +662,7 @@ void drawNewsPage() {
   tft.setTextDatum(TL_DATUM);
   tft.setTextFont(2);
   tft.setTextColor(C_ACC, C_PANEL);
-  tft.drawString(fitText(feed.source.length() ? feed.source : "NEWS", 270, 2), 8, 5);
+  tft.drawString("Top Stories", 8, 5);
 
   time_t t = time(nullptr);
   struct tm tm;

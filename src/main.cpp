@@ -19,8 +19,17 @@ static constexpr int PIN_TOUCH_CS = 33;
 static constexpr int PIN_TOUCH_IRQ = 36;
 static constexpr int PIN_LDR = 34;
 static constexpr int MAX_HEADLINES = 32;
+static constexpr int MAX_NEWS_ARTICLES = 6;
+static constexpr int NEWS_IMAGE_SOURCE_W = 128;
+static constexpr int NEWS_IMAGE_SOURCE_H = 72;
+static constexpr int NEWS_IMAGE_W = 96;
+static constexpr int NEWS_IMAGE_H = 54;
+static constexpr int NEWS_IMAGE_SOURCE_PIXELS = NEWS_IMAGE_SOURCE_W * NEWS_IMAGE_SOURCE_H;
+static constexpr int NEWS_IMAGE_PIXELS = NEWS_IMAGE_W * NEWS_IMAGE_H;
 static constexpr int MAX_TIDE_POINTS = 49;
+static constexpr int MAX_TIDE_FUTURE = 96;
 static constexpr int MAX_TIDE_EVENTS = 6;
+static constexpr int MAX_TIDE_FUTURE_EVENTS = 6;
 
 static uint16_t C_BG = 0x0862;
 static uint16_t C_PANEL = 0x11E6;
@@ -83,6 +92,11 @@ struct Stats {
   uint32_t at = 0;
 };
 
+struct NewsArticle {
+  String title, summary, source, link;
+  bool imageReady = false;
+};
+
 struct Feed {
   String city;
   String source;
@@ -94,6 +108,9 @@ struct Feed {
   int forecastCode[4];
   int forecastCount = 0;
   int count = 0;
+  NewsArticle articles[MAX_NEWS_ARTICLES];
+  int articleCount = 0;
+  uint32_t articleAt = 0;
   float temp = 0;
   float feels = 0;
   float humidity = -1;
@@ -110,8 +127,16 @@ struct Tide {
   String eventKind[MAX_TIDE_EVENTS], eventTime[MAX_TIDE_EVENTS];
   float eventHeight[MAX_TIDE_EVENTS];
   int16_t eventMinutesAgo[MAX_TIDE_EVENTS];
-  int count = 0, eventCount = 0;
+  float futureHeights[MAX_TIDE_FUTURE];
+  int16_t futureMinutes[MAX_TIDE_FUTURE];
+  String futureEventKind[MAX_TIDE_FUTURE_EVENTS], futureEventTime[MAX_TIDE_FUTURE_EVENTS];
+  float futureEventHeight[MAX_TIDE_FUTURE_EVENTS];
+  int16_t futureEventMinutes[MAX_TIDE_FUTURE_EVENTS];
+  int count = 0, eventCount = 0, futureCount = 0, futureEventCount = 0;
+  int16_t latestAge = 0;
   float latest = 0;
+  float current = 0;
+  bool hasCurrent = false;
   bool valid = false;
   uint32_t at = 0;
 };
@@ -129,6 +154,7 @@ struct Marine {
 Config cfg;
 Stats stats;
 Feed feed;
+uint16_t newsImages[MAX_NEWS_ARTICLES][NEWS_IMAGE_PIXELS];
 Tide tide;
 Marine marine;
 
@@ -145,6 +171,7 @@ uint32_t lastClockMs = 0;
 uint32_t lastStatsMs = 0;
 uint32_t lastTickerMs = 0;
 uint32_t lastNewsMs = 0;
+uint32_t lastNewsArticleSlot = 0;
 uint32_t lastForecastMs = 0;
 uint32_t lastTideMs = 0, lastMarineMs = 0, lastPcMs = 0;
 uint32_t lastSysMs = 0;
@@ -507,6 +534,72 @@ void drawDashboard() {
   feedDirty = false;
 }
 
+int base64Value(char c) {
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+  if (c >= '0' && c <= '9') return c - '0' + 52;
+  if (c == '+') return 62;
+  if (c == '/') return 63;
+  return -1;
+}
+
+bool decodeNewsImage(const String& encoded, uint16_t* destination) {
+  size_t sourceByte = 0;
+  uint8_t lowByte = 0;
+  int value = 0, bits = -8;
+  for (size_t i = 0; i < encoded.length() && sourceByte < NEWS_IMAGE_SOURCE_PIXELS * 2; i++) {
+    int decoded = base64Value(encoded[i]);
+    if (decoded < 0) continue;
+    value = (value << 6) | decoded;
+    bits += 6;
+    if (bits >= 0) {
+      uint8_t byte = (uint8_t)((value >> bits) & 0xFF);
+      if ((sourceByte & 1) == 0) {
+        lowByte = byte;
+      } else {
+        size_t pixel = sourceByte / 2;
+        int sourceX = (int)(pixel % NEWS_IMAGE_SOURCE_W);
+        int sourceY = (int)(pixel / NEWS_IMAGE_SOURCE_W);
+        int x = sourceX * NEWS_IMAGE_W / NEWS_IMAGE_SOURCE_W;
+        int y = sourceY * NEWS_IMAGE_H / NEWS_IMAGE_SOURCE_H;
+        destination[y * NEWS_IMAGE_W + x] = (uint16_t)lowByte | ((uint16_t)byte << 8);
+      }
+      sourceByte++;
+      bits -= 8;
+    }
+  }
+  return sourceByte == NEWS_IMAGE_SOURCE_PIXELS * 2;
+}
+
+int drawWrappedText(const String& text, int x, int y, int width, int maxLines, uint16_t color) {
+  String line;
+  int lines = 0;
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(1);
+  tft.setTextColor(color, C_BG);
+  for (int i = 0; i <= text.length() && lines < maxLines; i++) {
+    char c = i < text.length() ? text[i] : ' ';
+    if (c == '\n' || c == ' ' || i == text.length()) {
+      String candidate = line;
+      if (c != ' ' && i < text.length()) candidate += c;
+      if (tft.textWidth(candidate, 1) <= width) {
+        line = candidate;
+      } else if (line.length()) {
+        tft.drawString(line, x, y + lines * 12);
+        lines++;
+        line = (c == ' ') ? "" : String(c);
+      }
+    } else {
+      line += c;
+    }
+  }
+  if (line.length() && lines < maxLines) {
+    tft.drawString(fitText(line, width, 1), x, y + lines * 12);
+    lines++;
+  }
+  return lines;
+}
+
 void drawNewsPage() {
   tft.fillScreen(C_BG);
   tft.fillRect(0, 0, 320, 26, C_PANEL);
@@ -525,23 +618,45 @@ void drawNewsPage() {
   tft.setTextColor(C_DIM, C_PANEL);
   tft.drawString(buf, 312, 5);
 
-  tft.setTextDatum(TL_DATUM);
-  for (int i = 0; i < 6; i++) {
-    int y = 34 + i * 28;
-    if (i < feed.count) {
-      tft.setTextColor(C_ACC, C_BG);
-      tft.drawString(String(i + 1), 8, y);
-      tft.setTextColor(C_TEXT, C_BG);
-      tft.drawString(fitText(feed.headlines[i], 280, 2), 26, y);
-    } else {
-      tft.setTextColor(C_LINE, C_BG);
-      tft.drawString("—", 8, y);
+  if (feed.articleCount) {
+    int articleIndex = feed.articleCount == 1 ? 0 :
+      (int)(((millis() - feed.articleAt) / 30000UL) % feed.articleCount);
+    lastNewsArticleSlot = (millis() - feed.articleAt) / 30000UL;
+    NewsArticle& article = feed.articles[articleIndex];
+    if (article.imageReady) tft.pushImage(216, 32, NEWS_IMAGE_W, NEWS_IMAGE_H, newsImages[articleIndex]);
+    else tft.fillRoundRect(216, 32, NEWS_IMAGE_W, NEWS_IMAGE_H, 4, C_PANEL);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextFont(2);
+    tft.setTextColor(C_TEXT, C_BG);
+    drawWrappedText(article.title, 8, 32, 166, 3, C_TEXT);
+    tft.setTextFont(1);
+    tft.setTextColor(C_ACC, C_BG);
+    tft.drawString(fitText(article.source, 166, 1), 8, 84);
+    drawWrappedText(article.summary, 8, 112, 304, 8, C_TEXT);
+    tft.setTextColor(C_DIM, C_BG);
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString("ARTICLE " + String(articleIndex + 1) + "/" + String(feed.articleCount), 8, 222);
+  } else {
+    tft.setTextDatum(TL_DATUM);
+    for (int i = 0; i < 6; i++) {
+      int y = 34 + i * 28;
+      if (i < feed.count) {
+        tft.setTextColor(C_ACC, C_BG);
+        tft.drawString(String(i + 1), 8, y);
+        tft.setTextColor(C_TEXT, C_BG);
+        tft.drawString(fitText(feed.headlines[i], 280, 2), 26, y);
+      } else {
+        tft.setTextColor(C_LINE, C_BG);
+        tft.drawString("—", 8, y);
+      }
     }
+    tft.setTextFont(1);
+    tft.setTextColor(C_DIM, C_BG);
+    tft.drawString("tap to cycle pages", 8, 222);
   }
 
   tft.setTextFont(1);
   tft.setTextColor(C_DIM, C_BG);
-  tft.drawString("tap to cycle pages", 8, 222);
   if (feed.valid) {
     tft.setTextDatum(TR_DATUM);
     tft.drawString(String((millis() - feed.at) / 60000) + "m ago", 312, 222);
@@ -750,34 +865,121 @@ void drawPageHeader(const String& title, const String& detail) {
 void drawMetricCard(int x,int y,int w,int h,const String& label,const String& value,const String& foot,uint16_t accent) {
   tft.fillRoundRect(x,y,w,h,8,C_PANEL);
   tft.fillRoundRect(x,y,3,h,2,accent);
-  tft.setTextDatum(TL_DATUM); tft.setTextFont(1); tft.setTextColor(C_DIM,C_PANEL); tft.drawString(label,x+10,y+8);
-  tft.setTextFont(4); tft.setTextColor(C_TEXT,C_PANEL); tft.drawString(fitText(value,w-18,4),x+10,y+23);
-  if(foot.length()){tft.setTextFont(1);tft.setTextColor(C_DIM,C_PANEL);tft.drawString(fitText(foot,w-18,1),x+10,y+h-15);}
+  tft.setTextDatum(TL_DATUM); tft.setTextFont(1); tft.setTextColor(C_DIM,C_PANEL); tft.drawString(label,x+10,y+7);
+  tft.setTextFont(4); tft.setTextColor(C_TEXT,C_PANEL); tft.drawString(fitText(value,w-18,4),x+10,y+20);
+  if(foot.length()){tft.setTextFont(1);tft.setTextColor(C_DIM,C_PANEL);tft.drawString(fitText(foot,w-18,1),x+10,y+h-12);}
+}
+
+int nextTideEvent(bool high) {
+  int best = -1;
+  for (int i = 0; i < tide.futureEventCount; i++) {
+    if (tide.futureEventMinutes[i] < 0) continue;
+    if ((tide.futureEventKind[i] == "H") != high) continue;
+    if (best < 0 || tide.futureEventMinutes[i] < tide.futureEventMinutes[best]) best = i;
+  }
+  return best;
+}
+
+void drawTideCard(int x,int y,int w,int h,const String& label,const String& value,const String& foot,uint16_t accent) {
+  tft.fillRoundRect(x,y,w,h,7,C_PANEL);
+  tft.fillRoundRect(x,y,3,h,2,accent);
+  tft.setTextDatum(TL_DATUM); tft.setTextFont(1); tft.setTextColor(C_DIM,C_PANEL); tft.drawString(label,x+9,y+6);
+  tft.setTextFont(4); tft.setTextColor(C_TEXT,C_PANEL); tft.drawString(fitText(value,w-16,4),x+9,y+17);
+  if(foot.length()){tft.setTextFont(1); tft.setTextColor(C_DIM,C_PANEL); tft.drawString(fitText(foot,w-16,1),x+9,y+h-11);}
 }
 
 void drawTidePage() {
-  tft.fillScreen(C_BG); drawPageHeader("TIDE","HEYSHAM  /  METRES");
+  tft.fillScreen(C_BG);
+  drawPageHeader("TIDE", (tide.station.length()?tide.station:cfg.tidePort)+"  /  METRES");
   if(!tide.valid){tft.setTextDatum(MC_DATUM);tft.setTextFont(2);tft.setTextColor(C_DIM,C_BG);tft.drawString("Waiting for tide observations",160,118);return;}
-  String nextLabel="LATEST TIDE"; String nextValue="No event yet";
-  if(tide.eventCount){int i=tide.eventCount-1;nextLabel=(tide.eventKind[i]=="H"?"LAST HIGH":"LAST LOW");nextValue=tide.eventTime[i]+"  "+String(tide.eventHeight[i],2)+" m";}
-  drawMetricCard(8,38,146,56,"CURRENT HEIGHT",String(tide.latest,2)+" m",tide.latestTime+" local",C_ACC);
-  drawMetricCard(166,38,146,56,nextLabel,nextValue,"Predicted level",C_OK);
-  tft.fillRoundRect(8,102,304,105,8,C_PANEL);
-  tft.setTextDatum(TL_DATUM);tft.setTextFont(1);tft.setTextColor(C_DIM,C_PANEL);tft.drawString("PAST 12 HOURS",18,108);
-  if(tide.count>1){
-    float lo=10000,hi=-10000;for(int i=0;i<tide.count;i++){lo=min(lo,tide.heights[i]);hi=max(hi,tide.heights[i]);}
-    float pad=max(0.15f,(hi-lo)*0.12f);lo-=pad;hi+=pad;
-    int left=25,right=300,top=130,bottom=185;
-    for(int g=0;g<3;g++){int gy=top+g*(bottom-top)/2;tft.drawFastHLine(left,gy,right-left,C_LINE);}
-    for(int i=1;i<tide.count;i++){
-      int x1=right-(long)tide.minutesAgo[i-1]*(right-left)/720;int x2=right-(long)tide.minutesAgo[i]*(right-left)/720;
-      int y1=bottom-(int)((tide.heights[i-1]-lo)*(bottom-top)/(hi-lo));int y2=bottom-(int)((tide.heights[i]-lo)*(bottom-top)/(hi-lo));
-      tft.drawLine(x1,y1,x2,y2,C_ACC);tft.fillCircle(x2,y2,2,C_TEXT);
-    }
-    tft.fillCircle(right,bottom-(int)((tide.latest-lo)*(bottom-top)/(hi-lo)),4,C_OK);
-    tft.setTextColor(C_DIM,C_PANEL);tft.drawString("-12h",17,190);tft.setTextDatum(TR_DATUM);tft.drawString("NOW",302,190);
+
+  int nextHigh=nextTideEvent(true), nextLow=nextTideEvent(false);
+  float current=tide.hasCurrent?tide.current:tide.latest;
+  drawTideCard(8,36,98,60,"CURRENT HEIGHT",String(current,2),tide.hasCurrent?"predicted now":tide.latestTime+" local",C_ACC);
+  drawTideCard(111,36,98,60,"NEXT HIGH",nextHigh<0?"--:--":tide.futureEventTime[nextHigh],nextHigh<0?"No forecast":String(tide.futureEventHeight[nextHigh],2)+" m",C_WARN);
+  drawTideCard(214,36,98,60,"NEXT LOW",nextLow<0?"--:--":tide.futureEventTime[nextLow],nextLow<0?"No forecast":String(tide.futureEventHeight[nextLow],2)+" m",C_OK);
+
+  tft.fillRoundRect(8,100,304,100,8,C_PANEL);
+  tft.setTextDatum(TL_DATUM);tft.setTextFont(1);tft.setTextColor(C_DIM,C_PANEL);tft.drawString("PAST 12 HOURS",17,106);
+  tft.setTextDatum(TR_DATUM);tft.drawString("NEXT 12 HOURS",303,106);
+
+  const int left=34,right=308,top=124,bottom=182,center=(left+right)/2,window=720;
+  auto xAt=[&](int mins){return (int)(center + (long)mins*(right-center)/window);};
+
+  float lo=10000,hi=-10000; bool any=false;
+  for(int i=0;i<tide.count;i++){
+    int m=-((int)tide.minutesAgo[i]+tide.latestAge);
+    if(m<-window||m>0) continue;
+    lo=min(lo,tide.heights[i]);hi=max(hi,tide.heights[i]);any=true;
   }
-  for(int i=0;i<2&&i<tide.eventCount;i++){int n=tide.eventCount-1-i;int x=12+i*154;tft.setTextDatum(TL_DATUM);tft.setTextFont(1);uint16_t col=tide.eventKind[n]=="H"?C_WARN:C_ACC;tft.setTextColor(col,C_BG);tft.drawString(tide.eventKind[n]=="H"?"HIGH":"LOW",x,218);tft.setTextColor(C_TEXT,C_BG);tft.drawString(tide.eventTime[n]+"  "+String(tide.eventHeight[n],1)+"m",x+40,218);}
+  for(int i=0;i<tide.futureCount;i++){
+    int m=tide.futureMinutes[i];
+    if(m<-window||m>window) continue;
+    lo=min(lo,tide.futureHeights[i]);hi=max(hi,tide.futureHeights[i]);any=true;
+  }
+  lo=min(lo,current);hi=max(hi,current);any=true;
+  if(!any){lo=tide.latest-0.5f;hi=tide.latest+0.5f;}
+  float pad=max(0.15f,(hi-lo)*0.10f);lo-=pad;hi+=pad;
+  if(hi-lo<0.001f){lo-=0.5f;hi+=0.5f;}
+  auto yAt=[&](float v){return bottom-(int)((v-lo)*(bottom-top)/(hi-lo));};
+
+  for(int g=0;g<3;g++){int gy=top+g*(bottom-top)/2;tft.drawFastHLine(left,gy,right-left,C_LINE);}
+  tft.setTextDatum(TR_DATUM);tft.setTextColor(C_DIM,C_PANEL);
+  tft.drawString(String(hi,1),left-4,top-7);
+  tft.drawString(String(lo,1),left-4,bottom-7);
+
+  bool have=false;int px=0,py=0;
+  for(int i=0;i<tide.count;i++){
+    int m=-((int)tide.minutesAgo[i]+tide.latestAge);
+    if(m<-window) continue;
+    if(m>0) break;
+    int x=xAt(m),y=yAt(tide.heights[i]);
+    if(have)tft.drawLine(px,py,x,y,C_ACC);
+    px=x;py=y;have=true;
+  }
+  for(int i=0;i<tide.futureCount;i++){
+    int m=tide.futureMinutes[i];
+    if(m<-window) continue;
+    if(m>window) break;
+    int x=xAt(m),y=yAt(tide.futureHeights[i]);
+    if(have)tft.drawLine(px,py,x,y,C_OK);
+    px=x;py=y;have=true;
+  }
+
+  for(int i=0;i<tide.eventCount;i++){
+    int m=-((int)tide.eventMinutesAgo[i]+tide.latestAge);
+    if(m<-window||m>0) continue;
+    tft.fillCircle(xAt(m),yAt(tide.eventHeight[i]),2,tide.eventKind[i]=="H"?C_WARN:C_ACC);
+  }
+  for(int i=0;i<tide.futureEventCount;i++){
+    int m=tide.futureEventMinutes[i];
+    if(m<0||m>window) continue;
+    int x=xAt(m),y=yAt(tide.futureEventHeight[i]);
+    bool high=tide.futureEventKind[i]=="H";
+    uint16_t col=high?C_WARN:C_ACC;
+    tft.fillCircle(x,y,3,col);
+    int ly=high?y-10:y+10;
+    if(ly<top+2) ly=y+10;
+    if(ly>bottom-2) ly=y-10;
+    tft.setTextDatum(MC_DATUM);tft.setTextFont(1);tft.setTextColor(col,C_PANEL);
+    tft.drawString(high?"H":"L",x,ly);
+  }
+
+  tft.drawFastVLine(center,top,bottom-top,C_LINE);
+  int cy=yAt(current);
+  tft.fillCircle(center,cy,4,C_TEXT);
+  tft.drawCircle(center,cy,6,C_ACC);
+
+  tft.setTextDatum(TL_DATUM);tft.setTextFont(1);tft.setTextColor(C_DIM,C_PANEL);
+  tft.drawString("-12h",26,188);
+  tft.setTextDatum(TC_DATUM);tft.drawString("NOW",center,188);
+  tft.setTextDatum(TR_DATUM);tft.drawString("+12h",right,188);
+
+  tft.fillRoundRect(8,205,304,26,7,C_PANEL);
+  tft.setTextDatum(TL_DATUM);tft.setTextFont(1);tft.setTextColor(C_DIM,C_PANEL);
+  String footer="GAUGE "+tide.latestTime+"  "+String(tide.latest,1)+"m";
+  footer+=tide.latestAge>0?"    UPDATED "+String(tide.latestAge)+"m AGO":"    LIVE";
+  tft.drawString(fitText(footer,286,1),17,214);
 }
 
 void drawMarinePage() {
@@ -1005,6 +1207,16 @@ void handleFeed() {
     h.trim();
     if (h.length()) feed.headlines[feed.count++] = h;
   }
+  feed.articleCount = 0;
+  for (JsonObject article : doc["articles"].as<JsonArray>()) {
+    if (feed.articleCount >= MAX_NEWS_ARTICLES) break;
+    int i = feed.articleCount++;
+    feed.articles[i].title = article["title"] | "";
+    feed.articles[i].summary = article["summary"] | "";
+    feed.articles[i].source = article["source"] | feed.source;
+    feed.articles[i].link = article["link"] | "";
+    feed.articles[i].imageReady = false;
+  }
   feed.forecastCount = 0;
   JsonArray forecast = doc["forecast"].as<JsonArray>();
   for (JsonObject day : forecast) {
@@ -1017,17 +1229,38 @@ void handleFeed() {
   }
   feed.valid = true;
   feed.at = millis();
+  feed.articleAt = feed.at;
+  lastNewsArticleSlot = 0;
   buildTicker();
+  feedDirty = true;
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleNewsImage() {
+  int index = server.arg("i").toInt();
+  if (index < 0 || index >= feed.articleCount) {
+    server.send(400, "application/json", "{\"ok\":false}");
+    return;
+  }
+  if (!decodeNewsImage(server.arg("plain"), newsImages[index])) {
+    server.send(400, "application/json", "{\"ok\":false}");
+    return;
+  }
+  feed.articles[index].imageReady = true;
   feedDirty = true;
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
 void handleTide() {
   JsonDocument doc; if(deserializeJson(doc,server.arg("plain"))){server.send(400,"application/json","{\"ok\":false}");return;}
-  tide.station=doc["station"]|cfg.tidePort; tide.latestTime=doc["latest_time"]|""; tide.count=0;
+  tide.station=doc["station"]|cfg.tidePort; tide.latestTime=doc["latest_time"]|""; tide.latestAge=doc["latest_age"]|0; tide.count=0;
   for(JsonArray row:doc["points"].as<JsonArray>()){if(tide.count>=MAX_TIDE_POINTS)break;int i=tide.count++; tide.minutesAgo[i]=row[0]|0; tide.heights[i]=row[1]|0.0f;}
   tide.eventCount=0; for(JsonArray row:doc["events"].as<JsonArray>()){if(tide.eventCount>=MAX_TIDE_EVENTS)break;int i=tide.eventCount++;tide.eventMinutesAgo[i]=row[0]|0;tide.eventHeight[i]=row[1]|0.0f;tide.eventKind[i]=row[2]|"";tide.eventTime[i]=row[3]|"";}
-  tide.latest=tide.count?tide.heights[tide.count-1]:0;tide.valid=tide.count>0;tide.at=millis();server.send(200,"application/json","{\"ok\":true}");
+  tide.futureCount=0; for(JsonArray row:doc["future"].as<JsonArray>()){if(tide.futureCount>=MAX_TIDE_FUTURE)break;int i=tide.futureCount++;tide.futureMinutes[i]=row[0]|0;tide.futureHeights[i]=row[1]|0.0f;}
+  tide.futureEventCount=0; for(JsonArray row:doc["future_events"].as<JsonArray>()){if(tide.futureEventCount>=MAX_TIDE_FUTURE_EVENTS)break;int i=tide.futureEventCount++;tide.futureEventMinutes[i]=row[0]|0;tide.futureEventHeight[i]=row[1]|0.0f;tide.futureEventKind[i]=row[2]|"";tide.futureEventTime[i]=row[3]|"";}
+  tide.latest=tide.count?tide.heights[tide.count-1]:0;tide.valid=tide.count>0;tide.at=millis();
+  tide.hasCurrent=!doc["current"].isNull();tide.current=tide.hasCurrent?doc["current"].as<float>():tide.latest;
+  server.send(200,"application/json","{\"ok\":true}");
 }
 
 void handleMarine() {
@@ -1062,6 +1295,7 @@ void setupServer() {
   server.on("/api/wifi", HTTP_POST, handleWifi);
   server.on("/api/stats", HTTP_POST, handleStats);
   server.on("/api/feed", HTTP_POST, handleFeed);
+  server.on("/api/newsimage", HTTP_POST, handleNewsImage);
   server.on("/api/tide", HTTP_POST, handleTide);
   server.on("/api/marine", HTTP_POST, handleMarine);
   server.on("/api/reboot", HTTP_POST, handleReboot);
@@ -1178,6 +1412,7 @@ void updateDisplay() {
     drawTickerStep();
   } else if (page == 1) {
     if (feedDirty) { feedDirty=false; drawNewsPage(); }
+    else if (feed.articleCount > 1 && (now - feed.articleAt) / 30000UL != lastNewsArticleSlot) drawNewsPage();
   } else if (page == 2) {
     if (feedDirty) { feedDirty=false; drawForecastPage(); }
   } else if (page == 3) {

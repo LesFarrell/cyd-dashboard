@@ -7,8 +7,10 @@ ESP32 over your LAN.
 """
 
 import argparse
+import base64
 import datetime
 import html
+import io
 import json
 import math
 import os
@@ -19,11 +21,23 @@ import struct
 import subprocess
 import sys
 import time
+import unicodedata
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import psutil
 import requests
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
+
+try:
+    from PIL import Image, ImageOps
+except ImportError:
+    Image = None
+    ImageOps = None
 
 DISCOVER_PORT = 8266
 DEFAULT_FEED = "\n".join(
@@ -37,6 +51,18 @@ CONFIG_FILE = Path(__file__).with_name("agent.json")
 STATE = {"host": None, "lock": None, "net": None, "net_at": None}
 DEFAULT_TIDE_STATION = "E73424"
 TIDE_LOCATION_CACHE = {}
+NEWS_IMAGE_W = 128
+NEWS_IMAGE_H = 72
+NEWS_ARTICLE_LIMIT = 6
+NEWS_ITEM_LIMIT = 32
+NEWS_IMAGE_CACHE = {}
+NEWS_ARTICLE_CACHE = {}
+NEWS_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    )
+}
 
 
 def load_agent_config():
@@ -346,6 +372,85 @@ def find_tide_events(readings, max_events=6):
     return events[-max_events:]
 
 
+def _parse_time(value):
+    return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _level_at(timeline, at):
+    """Interpolate the predicted level at a given time."""
+    if not timeline:
+        return None
+    if at <= timeline[0][0]:
+        return timeline[0][1]
+    if at >= timeline[-1][0]:
+        return timeline[-1][1]
+    for (t0, v0), (t1, v1) in zip(timeline, timeline[1:]):
+        if t0 <= at <= t1:
+            span = (t1 - t0).total_seconds()
+            return v1 if span <= 0 else v0 + (v1 - v0) * ((at - t0).total_seconds() / span)
+    return timeline[-1][1]
+
+
+def fetch_tide_prediction(lat, lon, latest_at, latest_value, now, max_points=96):
+    """Fetch the predicted curve and upcoming extremes, aligned to the gauge."""
+    params = {"latitude": lat, "longitude": lon, "datum": "LAT", "units": "meters"}
+    start = latest_at.isoformat(timespec="seconds").replace("+00:00", "Z")
+    end = (now + datetime.timedelta(hours=13)).isoformat(timespec="seconds").replace("+00:00", "Z")
+    timeline_response = requests.get(
+        "https://api.openwaters.io/tides/timeline",
+        params={**params, "start": start, "end": end},
+        timeout=15,
+        headers={"User-Agent": "cyd-dashboard/1.0"},
+    )
+    timeline_response.raise_for_status()
+    timeline = [
+        (_parse_time(item["time"]), float(item["level"]))
+        for item in timeline_response.json().get("timeline", [])
+    ]
+    if not timeline:
+        return [], [], None
+
+    # Remove the small datum/timing offset between the prediction and live gauge.
+    offset = latest_value - _level_at(timeline, latest_at)
+    future = []
+    for stamp, level in timeline:
+        if stamp < latest_at:
+            continue
+        minutes = round((stamp - now).total_seconds() / 60)
+        future.append([minutes, round(level + offset, 3)])
+    if len(future) > max_points:
+        indexes = [round(i * (len(future) - 1) / (max_points - 1)) for i in range(max_points)]
+        future = [future[i] for i in indexes]
+
+    end_events = (now + datetime.timedelta(hours=24)).isoformat(timespec="seconds").replace("+00:00", "Z")
+    extremes_response = requests.get(
+        "https://api.openwaters.io/tides/extremes",
+        params={
+            **params,
+            "start": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "end": end_events,
+        },
+        timeout=15,
+        headers={"User-Agent": "cyd-dashboard/1.0"},
+    )
+    extremes_response.raise_for_status()
+    events = []
+    for item in extremes_response.json().get("extremes", []):
+        stamp = _parse_time(item["time"])
+        if stamp < now:
+            continue
+        kind = "H" if item.get("high") else "L"
+        events.append([
+            max(0, round((stamp - now).total_seconds() / 60)),
+            round(float(item["level"]) + offset, 3),
+            kind,
+            stamp.astimezone().strftime("%H:%M"),
+        ])
+    events.sort(key=lambda row: row[0])
+    current = round(_level_at(timeline, now) + offset, 3)
+    return future, events, current
+
+
 def fetch_tide(station=DEFAULT_TIDE_STATION, station_name="Heysham", max_points=49):
     """Return the latest 24 hours from an EA local-datum tide gauge."""
     if not re.fullmatch(r"E\d+", station or ""):
@@ -375,7 +480,9 @@ def fetch_tide(station=DEFAULT_TIDE_STATION, station_name="Heysham", max_points=
     if not readings:
         raise RuntimeError(f"{station_name} gauge returned no readings")
 
-    latest_at = readings[-1][0]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    latest_at, latest_value = readings[-1]
+    latest_age = max(0, round((now - latest_at).total_seconds() / 60))
     events = [
         [
             max(0, round((latest_at - stamp).total_seconds() / 60)),
@@ -394,31 +501,223 @@ def fetch_tide(station=DEFAULT_TIDE_STATION, station_name="Heysham", max_points=
         [max(0, round((latest_at - stamp).total_seconds() / 60)), round(value, 3)]
         for stamp, value in readings
     ]
-    return {
+    future, future_events, current = [], [], None
+    try:
+        lat, lon, _ = fetch_tide_location(station)
+        future, future_events, current = fetch_tide_prediction(lat, lon, latest_at, latest_value, now)
+    except Exception as exc:
+        print(f"  tide prediction error: {exc}")
+    payload = {
         "station": station_name,
         "latest_time": latest_at.astimezone().strftime("%H:%M"),
+        "latest_age": latest_age,
         "points": points,
         "events": events,
+        "future": future,
+        "future_events": future_events,
     }
+    if current is not None:
+        payload["current"] = current
+    return payload
 
 
-def fetch_news(url, limit=6):
-    r = requests.get(url, timeout=10, headers={"User-Agent": "cyd-dashboard/1.0"})
-    r.raise_for_status()
-    root = ET.fromstring(r.content)
-    titles = []
+def clean_text(value):
+    if not value:
+        return ""
+    value = html.unescape(str(value))
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = html.unescape(value)
+    value = unicodedata.normalize("NFKD", value)
+    value = value.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def make_summary(text, max_chars=280, max_sentences=4):
+    text = clean_text(text)
+    if not text:
+        return ""
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    out = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        candidate = " ".join(out + [part])
+        if out and len(candidate) > max_chars:
+            remaining = max_chars - len(" ".join(out)) - 1
+            if remaining >= 40:
+                cut = part[:remaining]
+                if " " in cut:
+                    cut = cut.rsplit(" ", 1)[0]
+                out.append(cut.rstrip(" ,;:-") + "...")
+            break
+        out.append(part)
+        if len(out) >= max_sentences:
+            break
+    result = " ".join(out)
+    if len(result) > max_chars:
+        result = result[:max_chars].rsplit(" ", 1)[0].rstrip(" ,;:-") + "..."
+    return result
+
+
+def item_image_url(item):
+    candidates = []
+    for child in item.iter():
+        tag = child.tag.rsplit("}", 1)[-1].lower()
+        if tag in ("thumbnail", "content", "enclosure"):
+            url = child.attrib.get("url") or child.attrib.get("href") or ""
+            kind = (child.attrib.get("type", "") + " " + child.attrib.get("medium", "")).lower()
+            if url and ("image" in kind or re.search(r"\.(jpe?g|png|webp|gif)(\?|$)", url, re.I)):
+                candidates.append(url)
+        if tag in ("encoded", "description", "summary") and child.text:
+            match = re.search(r"<img[^>]+src=[\"']([^\"']+)", child.text, re.I)
+            if match:
+                candidates.append(html.unescape(match.group(1)))
+    return candidates[0] if candidates else ""
+
+
+def fetch_article_content(url, fallback):
+    if not url:
+        return make_summary(fallback), ""
+    cached = NEWS_ARTICLE_CACHE.get(url)
+    now = time.time()
+    if cached and now - cached[0] < 3600:
+        return cached[1], cached[2]
+    summary, image = make_summary(fallback), ""
+    if BeautifulSoup is not None and "news.google.com/rss/articles/" not in url:
+        try:
+            response = requests.get(url, timeout=8, headers=NEWS_HEADERS)
+            response.raise_for_status()
+            if not response.encoding:
+                response.encoding = "utf-8"
+            soup = BeautifulSoup(response.text, "html.parser")
+            for attrs in (
+                {"property": "og:image"},
+                {"property": "og:image:secure_url"},
+                {"name": "twitter:image"},
+            ):
+                tag = soup.find("meta", attrs=attrs)
+                if tag and tag.get("content"):
+                    image = tag["content"]
+                    break
+            if not image:
+                tag = soup.find("img", src=True)
+                if tag:
+                    image = tag["src"]
+            description = ""
+            for attrs in (
+                {"name": "description"},
+                {"property": "og:description"},
+                {"name": "twitter:description"},
+            ):
+                tag = soup.find("meta", attrs=attrs)
+                if tag and tag.get("content"):
+                    description = tag["content"]
+                    break
+            containers = [soup.find("article"), soup.find("main"), soup]
+            paragraphs = []
+            seen_paragraphs = set()
+            for body in containers:
+                if body is None:
+                    continue
+                for paragraph in body.find_all("p"):
+                    text = clean_text(paragraph.get_text(" ", strip=True))
+                    if len(text) < 40 or text in seen_paragraphs:
+                        continue
+                    low = text.lower()
+                    if any(
+                        bad in low
+                        for bad in (
+                            "cookie",
+                            "subscribe",
+                            "sign up",
+                            "advertisement",
+                            "all rights reserved",
+                            "follow us",
+                            "read more",
+                        )
+                    ):
+                        continue
+                    seen_paragraphs.add(text)
+                    paragraphs.append(text)
+                    if sum(len(p) for p in paragraphs) >= 700:
+                        break
+                if sum(len(p) for p in paragraphs) >= 700:
+                    break
+            summary = (
+                make_summary(" ".join(paragraphs))
+                or make_summary(description)
+                or summary
+            )
+        except Exception:
+            pass
+    NEWS_ARTICLE_CACHE[url] = (now, summary, image)
+    return summary, image
+
+
+def fetch_image_b64(url):
+    if not url or Image is None:
+        return None
+    cached = NEWS_IMAGE_CACHE.get(url)
+    now = time.time()
+    if cached and now - cached[0] < 21600:
+        return cached[1]
+    try:
+        response = requests.get(url, timeout=10, headers=NEWS_HEADERS)
+        response.raise_for_status()
+        if len(response.content) > 5_000_000:
+            return None
+        image = Image.open(io.BytesIO(response.content)).convert("RGB")
+        resampling = getattr(Image, "Resampling", Image)
+        image = ImageOps.fit(
+            image,
+            (NEWS_IMAGE_W, NEWS_IMAGE_H),
+            method=getattr(resampling, "LANCZOS", 1),
+        )
+        raw = image.tobytes()
+        out = bytearray(NEWS_IMAGE_W * NEWS_IMAGE_H * 2)
+        pos = 0
+        for index in range(0, len(raw), 3):
+            red, green, blue = raw[index], raw[index + 1], raw[index + 2]
+            color = ((red & 0xF8) << 8) | ((green & 0xFC) << 3) | (blue >> 3)
+            out[pos] = color & 0xFF
+            out[pos + 1] = color >> 8
+            pos += 2
+        encoded = base64.b64encode(bytes(out)).decode("ascii")
+        NEWS_IMAGE_CACHE[url] = (now, encoded)
+        return encoded
+    except Exception:
+        return None
+
+
+def fetch_news(url, limit=NEWS_ITEM_LIMIT):
+    response = requests.get(url, timeout=10, headers=NEWS_HEADERS)
+    response.raise_for_status()
+    root = ET.fromstring(response.content)
+    source = clean_text(root.findtext(".//channel/title") or "News")
+    items = []
     for item in root.iter("item"):
-        title = item.findtext("title")
+        title = clean_text(item.findtext("title"))
         if not title:
             continue
-        title = html.unescape(re.sub(r"<[^>]+>", "", title))
-        title = re.sub(r"\s+", " ", title).strip()
-        if title:
-            titles.append(title)
-        if len(titles) >= limit:
+        link = (item.findtext("link") or "").strip()
+        description = item.findtext("description") or ""
+        if not description:
+            description = item.findtext(
+                "{http://purl.org/rss/1.0/modules/content/}encoded"
+            ) or ""
+        items.append(
+            {
+                "title": title,
+                "link": link,
+                "summary": clean_text(description),
+                "image": item_image_url(item),
+                "source": short_source(source),
+            }
+        )
+        if len(items) >= limit:
             break
-    source = root.findtext(".//channel/title") or "News"
-    return titles, html.unescape(source).strip()
+    return items, source
 
 
 def feed_urls(value):
@@ -430,8 +729,8 @@ def short_source(source):
     return re.split(r"\s+-\s+", source)[0].strip() or "News"
 
 
-def fetch_news_feeds(value, limit=32):
-    """Fetch every configured feed and interleave their headlines."""
+def fetch_news_feeds(value, limit=NEWS_ITEM_LIMIT, article_limit=NEWS_ARTICLE_LIMIT):
+    """Fetch every configured feed, interleave headlines, and enrich top articles."""
     results = []
     errors = []
     for url in feed_urls(value):
@@ -443,20 +742,20 @@ def fetch_news_feeds(value, limit=32):
     if not results:
         raise RuntimeError("; ".join(errors) or "no feeds configured")
 
-    titles = []
+    selected = []
     seen = set()
     index = 0
-    while len(titles) < limit and any(index < len(t) for t, _ in results):
-        for feed_titles, _ in results:
-            if index >= len(feed_titles):
+    while len(selected) < limit and any(index < len(items) for items, _ in results):
+        for items, _ in results:
+            if index >= len(items):
                 continue
-            title = feed_titles[index]
-            key = title.casefold()
+            item = items[index]
+            key = item["title"].casefold()
             if key in seen:
                 continue
             seen.add(key)
-            titles.append(title)
-            if len(titles) >= limit:
+            selected.append(item)
+            if len(selected) >= limit:
                 break
         index += 1
 
@@ -465,7 +764,41 @@ def fetch_news_feeds(value, limit=32):
         name = short_source(source)
         if name not in sources:
             sources.append(name)
-    return titles, " + ".join(sources)
+
+    articles = []
+    images = []
+    for item in selected[:article_limit]:
+        summary, page_image = fetch_article_content(item["link"], item["summary"])
+        image_url = item["image"] or page_image
+        articles.append(
+            {
+                "title": item["title"],
+                "summary": summary or item["summary"],
+                "source": item["source"],
+                "link": item["link"],
+            }
+        )
+        images.append(fetch_image_b64(image_url))
+
+    titles = [item["title"] for item in selected]
+    return titles, " + ".join(sources), articles, images
+
+def post_news_images(session, host, images, timeout=10):
+    sent = 0
+    for index, encoded in enumerate(images):
+        if not encoded:
+            continue
+        try:
+            session.post(
+                f"http://{host}/api/newsimage?i={index}",
+                data=encoded,
+                headers={"Content-Type": "text/plain"},
+                timeout=timeout,
+            ).raise_for_status()
+            sent += 1
+        except Exception as exc:
+            print(f"  news image {index} error: {exc}")
+    return sent
 
 
 def stats_loop(interval, no_gpu):
@@ -532,7 +865,7 @@ def feed_loop(feed_interval):
             print(f"  marine error: {exc}")
         try:
             weather = fetch_weather(dev.get("lat", 51.5072), dev.get("lon", -0.1276), dev.get("units", "metric"))
-            titles, source = fetch_news_feeds(dev.get("feed") or DEFAULT_FEED)
+            titles, source, articles, images = fetch_news_feeds(dev.get("feed") or DEFAULT_FEED)
             payload = dict(weather)
             payload.update(
                 {
@@ -540,11 +873,14 @@ def feed_loop(feed_interval):
                     "units": dev.get("units", "metric"),
                     "headlines": titles,
                     "source": source,
+                    "articles": articles,
                 }
             )
-            session.post(f"http://{host}/api/feed", json=payload, timeout=4)
+            session.post(f"http://{host}/api/feed", json=payload, timeout=8).raise_for_status()
+            sent = post_news_images(session, host, images)
             print(
-                f"  feed: {weather['temp']}°, {len(titles)} headlines from {source}"
+                f"  feed: {weather['temp']}°, {len(titles)} headlines, "
+                f"{len(articles)} articles, {sent} images from {source}"
             )
         except Exception as exc:
             print(f"  feed error: {exc}")
@@ -590,10 +926,11 @@ def main():
         session.post(f"http://{host}/api/stats", json=collect(args.no_gpu), timeout=3)
         dev = session.get(f"http://{host}/api/config", timeout=5).json()
         weather = fetch_weather(dev.get("lat", 51.5072), dev.get("lon", -0.1276), dev.get("units", "metric"))
-        titles, source = fetch_news_feeds(dev.get("feed") or DEFAULT_FEED)
+        titles, source, articles, images = fetch_news_feeds(dev.get("feed") or DEFAULT_FEED)
         payload = dict(weather)
-        payload.update({"city": dev.get("city", ""), "units": dev.get("units", "metric"), "headlines": titles, "source": source})
-        session.post(f"http://{host}/api/feed", json=payload, timeout=5)
+        payload.update({"city": dev.get("city", ""), "units": dev.get("units", "metric"), "headlines": titles, "source": source, "articles": articles})
+        session.post(f"http://{host}/api/feed", json=payload, timeout=8).raise_for_status()
+        post_news_images(session, host, images)
         tide = fetch_tide(
             dev.get("tideStation", DEFAULT_TIDE_STATION),
             dev.get("tidePort", "Heysham"),

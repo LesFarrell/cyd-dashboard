@@ -290,7 +290,7 @@ def fetch_marine(lat, lon, station_name, units):
         "latitude": lat,
         "longitude": lon,
         "current": "wind_speed_10m,wind_direction_10m,wind_gusts_10m",
-        "daily": "sunrise,sunset",
+        "daily": "sunrise,sunset,moonrise,moonset",
         "forecast_days": 1,
         "timezone": "auto",
     }
@@ -330,6 +330,8 @@ def fetch_marine(lat, lon, station_name, units):
         "current_direction": sea.get("ocean_current_direction", -1),
         "sunrise": (daily.get("sunrise") or [""])[0][-5:],
         "sunset": (daily.get("sunset") or [""])[0][-5:],
+        "moonrise": (daily.get("moonrise") or [""])[0][-5:],
+        "moonset": (daily.get("moonset") or [""])[0][-5:],
         "moon": phase_name,
         "moon_illumination": illumination,
     }

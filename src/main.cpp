@@ -147,7 +147,7 @@ struct Tide {
 };
 
 struct Marine {
-  String station, windUnit, sunrise, sunset, moon;
+  String station, windUnit, sunrise, sunset, moonrise, moonset, moon;
   float wind = -1, windDirection = -1, windGust = -1;
   float waveHeight = -1, wavePeriod = -1, seaTemp = -100;
   float currentSpeed = -1, currentDirection = -1;
@@ -399,44 +399,36 @@ void buildTicker() {
   tickerW = tft.textWidth(tickerText, 4);
   tickerNextText = feed.headlines[(tickerIndex + 1) % feed.count];
   tickerNextW = tft.textWidth(tickerNextText, 4);
-  tickerX = 8;
+  tickerX = 0;
 }
 
 // ---------------------------------------------------------------- display
 
-void drawBarRow(int y, const char* label, float pct, const String& value) {
+void drawMainPcCard(int x, int y, const String& label, const String& value, const String& foot, uint16_t accent) {
+  tft.fillRoundRect(x, y, 148, 50, 7, C_PANEL);
+  tft.fillRoundRect(x, y, 3, 50, 2, accent);
   tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(1);
+  tft.setTextColor(C_DIM, C_PANEL);
+  tft.drawString(label, x + 10, y + 5);
   tft.setTextFont(2);
-  tft.setTextColor(C_DIM, C_BG);
-  tft.drawString(label, 8, y);
-
-  tft.setTextDatum(TR_DATUM);
-  tft.setTextColor(C_TEXT, C_BG);
-  tft.drawString(value, 312, y);
-
-  int bx = 8, by = y + 18, bw = 304, bh = 10;
-  tft.fillRoundRect(bx, by, bw, bh, 5, C_PANEL);
-  if (pct > 0) {
-    int fw = (int)(bw * (pct > 100 ? 100 : pct) / 100.0f);
-    if (fw < bh) fw = bh;
-    tft.fillRoundRect(bx, by, fw, bh, 5, barColor(pct));
-  }
+  tft.setTextColor(C_TEXT, C_PANEL);
+  tft.drawString(fitText(value, 128, 2), x + 10, y + 16);
+  tft.setTextFont(1);
+  tft.setTextColor(C_DIM, C_PANEL);
+  tft.drawString(fitText(foot, 128, 1), x + 10, y + 37);
 }
 
 void drawStats() {
-  tft.fillRect(0, 56, 320, 112, C_BG);
-  String cpuVal = stats.cpu < 0 ? "--" : String((int)roundf(stats.cpu)) + "%";
-  if (stats.cpuTemp >= 0) cpuVal += "  " + fmtTemp(stats.cpuTemp) + "C";
-  String gpuVal = stats.gpu < 0 ? "--" : String((int)roundf(stats.gpu)) + "%";
-  if (stats.gpuTemp >= 0) gpuVal += "  " + fmtTemp(stats.gpuTemp) + "C";
-  String ramVal = stats.ram < 0 ? "--" : String((int)roundf(stats.ram)) + "%";
-  if (stats.ramUsed >= 0 && stats.ramTotal > 0) {
-    ramVal += "  " + String(stats.ramUsed, 1) + "/" + String(stats.ramTotal, 1) + "G";
-  }
-
-  drawBarRow(58, "CPU", stats.cpu, cpuVal);
-  drawBarRow(96, "GPU", stats.gpu, gpuVal);
-  drawBarRow(134, "RAM", stats.ram, ramVal);
+  tft.fillRect(0, 56, 320, 106, C_BG);
+  drawMainPcCard(8, 56, "CPU", stats.cpu < 0 ? "--" : String((int)roundf(stats.cpu)) + "%",
+                 stats.cpuTemp < 0 ? "Temperature --" : fmtTemp(stats.cpuTemp), C_ACC);
+  drawMainPcCard(164, 56, "GPU", stats.gpu < 0 ? "--" : String((int)roundf(stats.gpu)) + "%",
+                 stats.gpuTemp < 0 ? "Temperature --" : fmtTemp(stats.gpuTemp), C_OK);
+  drawMainPcCard(8, 112, "RAM", stats.ram < 0 ? "--" : String((int)roundf(stats.ram)) + "%",
+                 stats.ramUsed < 0 ? "Used --" : "Used " + String(stats.ramUsed, 1) + " / " + String(stats.ramTotal, 1) + " GB", C_WARN);
+  drawMainPcCard(164, 112, "STORAGE", stats.disk < 0 ? "--" : String((int)roundf(stats.disk)) + "%",
+                 stats.diskUsed < 0 ? "Used --" : "Used " + String(stats.diskUsed, 1) + " / " + String(stats.diskTotal, 1) + " GB", C_ACC);
 
   ledForLoad(stats.cpu);
 }
@@ -497,32 +489,31 @@ void drawStatusLine() {
 
 void drawTickerFrame() {
   if (!tickerReady) {
-    tft.fillRect(0, 175, 320, 45, C_BG);
+    tft.fillRect(8, 168, 304, 36, C_PANEL);
     if (tickerText.length()) {
       tft.setTextDatum(TL_DATUM);
       tft.setTextFont(4);
-      tft.setTextColor(C_TEXT, C_BG);
-      tft.drawString(tickerText, tickerX, 181);
-      if (tickerNextText.length()) tft.drawString(tickerNextText, tickerX + tickerW + 80, 181);
+      tft.setTextColor(C_TEXT, C_PANEL);
+      tft.drawString(tickerText, 8 + tickerX, 169);
+      if (tickerNextText.length()) tft.drawString(tickerNextText, 8 + tickerX + tickerW + 80, 169);
     }
     return;
   }
-  ticker.fillSprite(C_BG);
+  ticker.fillSprite(C_PANEL);
   ticker.setTextDatum(TL_DATUM);
   ticker.setTextFont(4);
-  ticker.setTextColor(C_TEXT, C_BG);
+  ticker.setTextColor(C_TEXT, C_PANEL);
   if (tickerText.length()) {
-    ticker.drawString(tickerText, tickerX, 10);
-    ticker.drawString(tickerNextText, tickerX + tickerW + 80, 10);
+    ticker.drawString(tickerText, tickerX, 7);
+    ticker.drawString(tickerNextText, tickerX + tickerW + 80, 7);
   }
-  ticker.pushSprite(0, 175);
+  ticker.pushSprite(8, 170);
 }
 
 void drawTickerStep() {
   if (!tickerText.length()) return;
   if (millis() - lastTickerMs < 40) return;
   lastTickerMs = millis();
-  drawTickerFrame();
   tickerX -= 4;
   if (tickerX + tickerW < 0 && feed.count > 0) {
     tickerX += tickerW + 80;
@@ -532,6 +523,7 @@ void drawTickerStep() {
     tickerNextText = feed.headlines[(tickerIndex + 1) % feed.count];
     tickerNextW = tft.textWidth(tickerNextText, 4);
   }
+  drawTickerFrame();
 }
 
 void drawDashboard() {
@@ -541,6 +533,7 @@ void drawDashboard() {
   drawWeather();
   drawStats();
   drawStatusLine();
+  tft.fillRoundRect(8, 165, 304, 46, 7, C_PANEL);
   drawTickerFrame();
   lastMinute = -1;
   lastDay = -1;
@@ -1244,31 +1237,43 @@ void drawSunMoonPage() {
 
   tft.fillRoundRect(8, 38, 148, 80, 8, C_PANEL);
   tft.fillRoundRect(164, 38, 148, 80, 8, C_PANEL);
-  tft.setTextDatum(TL_DATUM); tft.setTextFont(1); tft.setTextColor(C_DIM, C_PANEL);
-  tft.drawString("SUN", 18, 46); tft.drawString("MOON", 174, 46);
-  drawSunIcon(42, 78, 10);
-  if (!loadAssetImage("moon" + String(moonAssetIndex(marine.moon)))) drawMoonGraphic(198, 78, 18, marine.moon, marine.moonIllumination);
+  tft.setTextDatum(MC_DATUM); tft.setTextFont(1); tft.setTextColor(C_DIM, C_PANEL);
+  tft.drawString("SUN", 82, 46); tft.drawString("MOON", 238, 46);
+  tft.setTextDatum(TL_DATUM);
+  drawSunIcon(40, 78, 10);
+  if (!loadAssetImage("moon" + String(moonAssetIndex(marine.moon)))) drawMoonGraphic(196, 78, 18, marine.moon, marine.moonIllumination);
   else {
     bool previousSwap = tft.getSwapBytes();
     tft.setSwapBytes(true);
-    tft.pushImage(171, 52, ASSET_IMAGE_W, ASSET_IMAGE_H, assetImageBuffer, ASSET_TRANSPARENT);
+    tft.pushImage(169, 52, ASSET_IMAGE_W, ASSET_IMAGE_H, assetImageBuffer, ASSET_TRANSPARENT);
     tft.setSwapBytes(previousSwap);
   }
   tft.setTextColor(C_TEXT, C_PANEL); tft.setTextFont(2);
-  tft.drawString("RISE  "+(marine.sunrise.length()?marine.sunrise:"--:--"), 68, 66);
-  tft.drawString("SET   "+(marine.sunset.length()?marine.sunset:"--:--"), 68, 88);
-  tft.drawString(fitText(marine.moon.length()?marine.moon:"Unknown", 86, 2), 222, 68);
-  tft.setTextFont(1); tft.setTextColor(C_ACC, C_PANEL);
-  tft.drawString(fitText(marine.moonIllumination >= 0 ? String(marine.moonIllumination)+"% illuminated" : "-- illumination", 86, 1), 222, 94);
+  tft.setTextDatum(TL_DATUM);
+  tft.drawString("RISE", 68, 66); tft.drawString("SET", 68, 88);
+  tft.setTextDatum(TR_DATUM);
+  tft.drawString(marine.sunrise.length()?marine.sunrise:"--:--", 150, 66);
+  tft.drawString(marine.sunset.length()?marine.sunset:"--:--", 150, 88);
+  tft.setTextDatum(TL_DATUM); tft.setTextFont(2); tft.setTextColor(C_TEXT, C_PANEL);
+  tft.drawString("RISE  "+(marine.moonrise.length()?marine.moonrise:"--:--"), 224, 66);
+  tft.drawString("SET   "+(marine.moonset.length()?marine.moonset:"--:--"), 224, 88);
 
-  tft.fillRoundRect(8, 126, 304, 72, 8, C_PANEL);
+  tft.fillRoundRect(8, 126, 148, 72, 8, C_PANEL);
   tft.setTextDatum(TL_DATUM); tft.setTextFont(1); tft.setTextColor(C_DIM, C_PANEL);
   tft.drawString("TODAY", 17, 134); tft.drawString("DAYLIGHT", 17, 158); tft.drawString("STATUS", 17, 180);
   tft.setTextDatum(TR_DATUM); tft.setTextColor(C_TEXT, C_PANEL);
   String duration = daylightMinutes >= 0 ? String(daylightMinutes / 60) + "h " + String(daylightMinutes % 60) + "m" : "--";
-  tft.drawString(duration, 303, 158);
+  tft.drawString(duration, 147, 158);
   tft.setTextColor(daylight ? C_SUN : C_DIM, C_PANEL);
-  tft.drawString(daylight ? "DAYLIGHT" : "NIGHT", 303, 180);
+  tft.drawString(daylight ? "DAYLIGHT" : "NIGHT", 147, 180);
+
+  tft.fillRoundRect(164, 126, 148, 72, 8, C_PANEL);
+  tft.setTextDatum(TL_DATUM); tft.setTextFont(1); tft.setTextColor(C_DIM, C_PANEL);
+  tft.drawString("MOON PHASE", 173, 134);
+  tft.setTextFont(2); tft.setTextColor(C_TEXT, C_PANEL);
+  tft.drawString(fitText(marine.moon.length()?marine.moon:"Unknown", 130, 2), 173, 153);
+  tft.setTextFont(1); tft.setTextColor(C_ACC, C_PANEL);
+  tft.drawString(fitText(marine.moonIllumination >= 0 ? String(marine.moonIllumination)+"% illuminated" : "-- illumination", 130, 1), 173, 180);
 
   tft.fillRoundRect(8, 206, 304, 26, 7, C_PANEL);
   tft.setTextDatum(TL_DATUM); tft.setTextColor(C_DIM, C_PANEL);
@@ -1623,7 +1628,7 @@ void handleTide() {
 void applyMarineDocument(JsonDocument& doc) {
   marine.station=doc["station"]|cfg.tidePort;marine.wind=doc["wind"]|-1.0f;marine.windDirection=doc["wind_direction"]|-1.0f;marine.windGust=doc["wind_gust"]|-1.0f;marine.windUnit=doc["wind_unit"]|"";
   marine.waveHeight=doc["wave_height"]|-1.0f;marine.wavePeriod=doc["wave_period"]|-1.0f;marine.seaTemp=doc["sea_temp"]|-100.0f;marine.currentSpeed=doc["current_speed"]|-1.0f;marine.currentDirection=doc["current_direction"]|-1.0f;
-  marine.sunrise=doc["sunrise"]|"";marine.sunset=doc["sunset"]|"";marine.moon=doc["moon"]|"";marine.moonIllumination=doc["moon_illumination"]|-1;
+  marine.sunrise=doc["sunrise"]|"";marine.sunset=doc["sunset"]|"";marine.moonrise=doc["moonrise"]|"";marine.moonset=doc["moonset"]|"";marine.moon=doc["moon"]|"";marine.moonIllumination=doc["moon_illumination"]|-1;
   marine.valid=true;marine.at=millis();
 }
 
@@ -1644,7 +1649,32 @@ void restoreDataCaches() {
 bool restoreFeedCache() {
   if (!newsCardReady) return false;
   JsonDocument doc;
-  if (!loadDataCache("/feed.json", doc, WEATHER_CACHE_MAX_AGE_SEC)) return false;
+  if (!loadDataCache("/feed.json", doc, WEATHER_CACHE_MAX_AGE_SEC)) {
+    feed.city = cfg.city;
+    feed.source = "Top Stories";
+    feed.units = cfg.units;
+    feed.count = 0;
+    feed.articleCount = 0;
+    for (int i = 0; i < MAX_NEWS_ARTICLES; i++) {
+      File article = SD.open(newsArticlePath(i), FILE_READ);
+      if (!article) continue;
+      JsonDocument stored;
+      bool valid = !deserializeJson(stored, article.readString());
+      article.close();
+      String title = valid ? (stored["title"] | "") : "";
+      title.trim();
+      if (!title.length()) continue;
+      if (feed.count < MAX_HEADLINES) feed.headlines[feed.count++] = title;
+      feed.articles[feed.articleCount++].imageReady = SD.exists(newsImagePath(i));
+    }
+    feed.valid = feed.articleCount > 0;
+    if (!feed.valid) return false;
+    feed.at = millis();
+    feed.articleAt = feed.at;
+    buildTicker();
+    feedDirty = true;
+    return true;
+  }
   feed.city = doc["city"] | "";
   feed.source = doc["source"] | "";
   feed.units = doc["units"] | "metric";
@@ -1816,7 +1846,7 @@ void updateDisplay() {
       lastDay = tm.tm_mday;
       drawDate();
     }
-    if (now - lastStatsMs >= 1000) {
+    if (now - lastStatsMs >= 5000) {
       lastStatsMs = now;
       drawStats();
       drawStatusLine();
@@ -1884,7 +1914,7 @@ void setup() {
   Serial.printf("News SD card: %s\n", newsCardReady ? "ready" : "not available");
 
   ticker.setColorDepth(16);
-  tickerReady = ticker.createSprite(320, 45) != nullptr;
+  tickerReady = ticker.createSprite(304, 36) != nullptr;
   Serial.printf("Ticker sprite: %s\n", tickerReady ? "ok" : "FAILED");
 
   page = 0;

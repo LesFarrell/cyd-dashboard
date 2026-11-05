@@ -13,14 +13,23 @@ TRANSPARENT = 0x0001
 
 
 def rgb565(image):
-    image = ImageOps.fit(image.convert("RGB"), SIZE, method=Image.Resampling.LANCZOS)
+    image = ImageOps.fit(image.convert("RGBA"), SIZE, method=Image.Resampling.LANCZOS)
     raw = image.tobytes()
-    out = bytearray()
-    for i in range(0, len(raw), 3):
-        r, g, b = raw[i : i + 3]
-        color = TRANSPARENT if r < 24 and g < 40 and b < 80 else ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-        out += bytes((color & 0xFF, color >> 8))
-    return base64.b64encode(out).decode("ascii")
+    pixels = bytearray()
+    for i in range(0, len(raw), 4):
+        r, g, b, a = raw[i : i + 4]
+        color = TRANSPARENT if a < 128 or (r < 24 and g < 40 and b < 80) else ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+        pixels += bytes((color & 0xFF, color >> 8))
+    compressed = bytearray()
+    i = 0
+    while i < len(pixels):
+        color = pixels[i : i + 2]
+        count = 1
+        while i + count * 2 < len(pixels) and pixels[i + count * 2 : i + count * 2 + 2] == color and count < 255:
+            count += 1
+        compressed += bytes((count, color[0], color[1]))
+        i += count * 2
+    return base64.b64encode(compressed).decode("ascii")
 
 
 def write_asset(name, image):
@@ -36,12 +45,19 @@ def crop_grid(path, cols, rows, names):
         write_asset(name, image.crop((x, y, x + cell_w, y + cell_h)))
 
 
-crop_grid(ROOT / "assets" / "astronomy" / "moon_sheet.png", 4, 2, [f"moon{i}" for i in range(8)])
+moon_names = [
+    "new-moon", "waxing-crescent", "first-quarter", "waxing-gibbous",
+    "full-moon", "waning-gibbous", "last-quarter", "waning-crescent",
+]
+for index, name in enumerate(moon_names):
+    write_asset(f"moon{index}", Image.open(ROOT / "assets" / "astronomy" / "tideplanet" / f"{name}.png"))
+
 write_asset("sun", Image.open(ROOT / "assets" / "astronomy" / "sun.png"))
-crop_grid(
-    ROOT / "assets" / "weather" / "sheet.png",
-    4,
-    2,
-    [f"weather{i}" for i in range(8)],
-)
+
+weather_names = [
+    "clear-day", "partly-cloudy-day", "cloudy", "fog",
+    "hail", "rain", "snow", "thunder",
+]
+for index, name in enumerate(weather_names):
+    write_asset(f"weather{index}", Image.open(ROOT / "assets" / "weather" / "visualcrossing" / f"{name}.png"))
 print(f"Prepared {len(list(OUT.glob('*.b64')))} assets in {OUT}")

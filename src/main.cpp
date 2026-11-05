@@ -680,33 +680,47 @@ bool loadAssetImage(const String& name) {
   String path = assetPath(name);
   if (!newsCardReady || !path.length()) return false;
   File image = SD.open(path, FILE_READ);
-  if (!image || image.size() != sizeof(assetImageBuffer)) {
+  if (!image) {
     if (image) image.close();
     return false;
   }
-  size_t read = image.read((uint8_t*)assetImageBuffer, sizeof(assetImageBuffer));
+  size_t pixels = 0;
+  while (image.available()) {
+    int count = image.read();
+    int low = image.read();
+    int high = image.read();
+    if (count <= 0 || low < 0 || high < 0 || pixels + (size_t)count > ASSET_IMAGE_PIXELS) {
+      image.close();
+      return false;
+    }
+    uint16_t color = ((uint16_t)high << 8) | (uint8_t)low;
+    for (int i = 0; i < count; i++) assetImageBuffer[pixels++] = color;
+  }
   image.close();
-  return read == sizeof(assetImageBuffer);
+  return pixels == ASSET_IMAGE_PIXELS;
 }
 
-bool decodeAssetImage(const String& encoded) {
-  size_t sourceByte = 0;
-  uint8_t lowByte = 0;
+bool decodeAssetRleToFile(const String& encoded, File& file) {
+  uint8_t record[3];
+  size_t recordByte = 0;
+  size_t pixels = 0;
   int value = 0, bits = -8;
-  for (size_t i = 0; i < encoded.length() && sourceByte < ASSET_IMAGE_PIXELS * 2; i++) {
+  for (size_t i = 0; i < encoded.length(); i++) {
     int decoded = base64Value(encoded[i]);
     if (decoded < 0) continue;
     value = (value << 6) | decoded;
     bits += 6;
     if (bits >= 0) {
-      uint8_t byte = (uint8_t)((value >> bits) & 0xFF);
-      if ((sourceByte & 1) == 0) lowByte = byte;
-      else assetImageBuffer[sourceByte / 2] = ((uint16_t)byte << 8) | lowByte;
-      sourceByte++;
+      record[recordByte++] = (uint8_t)((value >> bits) & 0xFF);
       bits -= 8;
+      if (recordByte == sizeof(record)) {
+        if (record[0] == 0 || pixels + record[0] > ASSET_IMAGE_PIXELS || file.write(record, sizeof(record)) != sizeof(record)) return false;
+        pixels += record[0];
+        recordByte = 0;
+      }
     }
   }
-  return sourceByte == ASSET_IMAGE_PIXELS * 2;
+  return recordByte == 0 && pixels == ASSET_IMAGE_PIXELS;
 }
 
 int drawWrappedText(const String& text, int x, int y, int width, int maxLines, uint16_t color, uint16_t background = C_BG) {
@@ -1537,16 +1551,21 @@ void handleNewsImage() {
 void handleAssetImage() {
   String name = server.arg("name");
   String path = assetPath(name);
-  if (!newsCardReady || !path.length() || !decodeAssetImage(server.arg("plain"))) {
+  if (!newsCardReady || !path.length()) {
     server.send(400, "application/json", "{\"ok\":false}"); return;
   }
   SD.remove(path);
   File image = SD.open(path, FILE_WRITE);
-  if (!image || image.write((const uint8_t*)assetImageBuffer, sizeof(assetImageBuffer)) != sizeof(assetImageBuffer)) {
-    if (image) image.close();
+  bool valid = image && decodeAssetRleToFile(server.arg("plain"), image);
+  if (image) image.close();
+  if (!valid) {
+    SD.remove(path);
+    server.send(400, "application/json", "{\"ok\":false}"); return;
+  }
+  if (!loadAssetImage(name)) {
+    SD.remove(path);
     server.send(500, "application/json", "{\"ok\":false}"); return;
   }
-  image.close();
   server.send(200, "application/json", "{\"ok\":true}");
 }
 

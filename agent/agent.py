@@ -868,11 +868,9 @@ def feed_loop(feed_interval):
         if not assets_ready:
             try:
                 sd = session.get(f"http://{host}/api/sd", timeout=5).json()
-                if sd.get("ready") and sd.get("assetCount", 0) < DISPLAY_ASSET_COUNT:
+                if sd.get("ready"):
                     assets_ready, sent_assets = post_display_assets(session, host)
                     print(f"  display assets: {sent_assets}/{DISPLAY_ASSET_COUNT}")
-                else:
-                    assets_ready = sd.get("assetCount", 0) >= DISPLAY_ASSET_COUNT
             except Exception as exc:
                 print(f"  display asset sync error: {exc}")
         try:

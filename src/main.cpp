@@ -27,6 +27,7 @@ static constexpr int NEWS_IMAGE_PIXELS = NEWS_IMAGE_W * NEWS_IMAGE_H;
 static constexpr int ASSET_IMAGE_W = 54;
 static constexpr int ASSET_IMAGE_H = 54;
 static constexpr int ASSET_IMAGE_PIXELS = ASSET_IMAGE_W * ASSET_IMAGE_H;
+static constexpr uint16_t ASSET_TRANSPARENT = 0x0001;
 static constexpr uint32_t NEWS_CACHE_MAX_AGE_SEC = 3UL * 24UL * 60UL * 60UL;
 static constexpr uint32_t TIDE_CACHE_MAX_AGE_SEC = 6UL * 60UL * 60UL;
 static constexpr uint32_t MARINE_CACHE_MAX_AGE_SEC = 24UL * 60UL * 60UL;
@@ -1200,7 +1201,7 @@ bool drawWeatherAsset(int code, int x, int y) {
   if (!loadAssetImage(name)) return false;
   bool previousSwap = tft.getSwapBytes();
   tft.setSwapBytes(true);
-  tft.pushImage(x, y, ASSET_IMAGE_W, ASSET_IMAGE_H, assetImageBuffer);
+  tft.pushImage(x, y, ASSET_IMAGE_W, ASSET_IMAGE_H, assetImageBuffer, ASSET_TRANSPARENT);
   tft.setSwapBytes(previousSwap);
   return true;
 }
@@ -1231,7 +1232,7 @@ void drawSunMoonPage() {
   else {
     bool previousSwap = tft.getSwapBytes();
     tft.setSwapBytes(true);
-    tft.pushImage(171, 52, ASSET_IMAGE_W, ASSET_IMAGE_H, assetImageBuffer);
+    tft.pushImage(171, 52, ASSET_IMAGE_W, ASSET_IMAGE_H, assetImageBuffer, ASSET_TRANSPARENT);
     tft.setSwapBytes(previousSwap);
   }
   tft.setTextColor(C_TEXT, C_PANEL); tft.setTextFont(2);

@@ -9,6 +9,7 @@ ROOT = Path(__file__).parent
 OUT = ROOT / "assets" / "cache"
 OUT.mkdir(parents=True, exist_ok=True)
 SIZE = (54, 54)
+TRANSPARENT = 0x0001
 
 
 def rgb565(image):
@@ -17,7 +18,7 @@ def rgb565(image):
     out = bytearray()
     for i in range(0, len(raw), 3):
         r, g, b = raw[i : i + 3]
-        color = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+        color = TRANSPARENT if r < 24 and g < 40 and b < 80 else ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
         out += bytes((color & 0xFF, color >> 8))
     return base64.b64encode(out).decode("ascii")
 

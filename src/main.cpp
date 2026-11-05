@@ -29,6 +29,7 @@ static constexpr int ASSET_IMAGE_H = 54;
 static constexpr int ASSET_IMAGE_PIXELS = ASSET_IMAGE_W * ASSET_IMAGE_H;
 static constexpr uint16_t ASSET_TRANSPARENT = 0x0001;
 static constexpr uint32_t NEWS_CACHE_MAX_AGE_SEC = 3UL * 24UL * 60UL * 60UL;
+static constexpr uint32_t WEATHER_CACHE_MAX_AGE_SEC = 60UL * 60UL;
 static constexpr uint32_t TIDE_CACHE_MAX_AGE_SEC = 6UL * 60UL * 60UL;
 static constexpr uint32_t MARINE_CACHE_MAX_AGE_SEC = 24UL * 60UL * 60UL;
 static constexpr int MAX_TIDE_POINTS = 49;
@@ -222,6 +223,10 @@ void drawPcMetrics();
 void drawSystemPage();
 void drawQr(const String& text, int x, int y);
 void updateBacklight(bool force = false);
+void applyTideDocument(JsonDocument& doc);
+void applyMarineDocument(JsonDocument& doc);
+void restoreDataCaches();
+bool restoreFeedCache();
 
 String fitText(const String& s, int maxW, uint8_t font) {
   if (tft.textWidth(s, font) <= maxW) return s;
@@ -646,7 +651,7 @@ bool loadDataCache(const char* path, JsonDocument& doc, uint32_t maxAge) {
   if (deserializeJson(doc, json)) { SD.remove(path); return false; }
   time_t now = time(nullptr);
   uint32_t cachedAt = doc["cached_at"] | 0UL;
-  if (now < 1700000000 || !cachedAt || (uint32_t)now < cachedAt || (uint32_t)now - cachedAt > maxAge) {
+  if (!cachedAt || (now >= 1700000000 && ((uint32_t)now < cachedAt || (uint32_t)now - cachedAt > maxAge))) {
     SD.remove(path);
     return false;
   }
@@ -1519,6 +1524,7 @@ void handleFeed() {
   lastNewsArticleSlot = 0;
   lastNewsImageMs = millis();
   buildTicker();
+  saveDataCache("/feed.json", doc);
   feedDirty = true;
   server.send(200, "application/json", "{\"ok\":true}");
 }
@@ -1625,6 +1631,57 @@ void handleMarine() {
   JsonDocument doc; if(deserializeJson(doc,server.arg("plain"))){server.send(400,"application/json","{\"ok\":false}");return;}
   applyMarineDocument(doc); saveDataCache("/marine.json", doc);
   server.send(200,"application/json","{\"ok\":true}");
+}
+
+void restoreDataCaches() {
+  restoreFeedCache();
+  JsonDocument doc;
+  if (loadDataCache("/tide.json", doc, TIDE_CACHE_MAX_AGE_SEC)) applyTideDocument(doc);
+  doc.clear();
+  if (loadDataCache("/marine.json", doc, MARINE_CACHE_MAX_AGE_SEC)) applyMarineDocument(doc);
+}
+
+bool restoreFeedCache() {
+  if (!newsCardReady) return false;
+  JsonDocument doc;
+  if (!loadDataCache("/feed.json", doc, WEATHER_CACHE_MAX_AGE_SEC)) return false;
+  feed.city = doc["city"] | "";
+  feed.source = doc["source"] | "";
+  feed.units = doc["units"] | "metric";
+  feed.temp = doc["temp"] | 0.0f;
+  feed.feels = doc["feels"] | 0.0f;
+  feed.humidity = doc["humidity"] | -1.0f;
+  feed.wind = doc["wind"] | -1.0f;
+  feed.code = doc["code"] | -1;
+  feed.count = 0;
+  for (JsonVariant v : doc["headlines"].as<JsonArray>()) {
+    if (feed.count >= MAX_HEADLINES) break;
+    String headline = v.as<String>();
+    headline.trim();
+    if (headline.length()) feed.headlines[feed.count++] = headline;
+  }
+  feed.articleCount = 0;
+  for (JsonObject article : doc["articles"].as<JsonArray>()) {
+    if (feed.articleCount >= MAX_NEWS_ARTICLES) break;
+    feed.articles[feed.articleCount++].imageReady = SD.exists(newsImagePath(feed.articleCount - 1));
+  }
+  feed.forecastCount = 0;
+  for (JsonObject day : doc["forecast"].as<JsonArray>()) {
+    if (feed.forecastCount >= 4) break;
+    int i = feed.forecastCount++;
+    feed.forecastDay[i] = day["day"] | "--";
+    feed.forecastHigh[i] = day["high"] | 0.0f;
+    feed.forecastLow[i] = day["low"] | 0.0f;
+    feed.forecastCode[i] = day["code"] | -1;
+  }
+  feed.valid = feed.articleCount > 0 || feed.city.length() > 0;
+  if (!feed.valid) return false;
+  feed.at = millis();
+  feed.articleAt = feed.at;
+  lastNewsArticleSlot = 0;
+  buildTicker();
+  feedDirty = true;
+  return true;
 }
 
 void handleReboot() {
@@ -1823,6 +1880,7 @@ void setup() {
   newsCardSPI.begin(18, 19, 23, 5);
   newsCardReady = SD.begin(5, newsCardSPI);
   cleanupNewsCache();
+  if (newsCardReady) restoreDataCaches();
   Serial.printf("News SD card: %s\n", newsCardReady ? "ready" : "not available");
 
   ticker.setColorDepth(16);
